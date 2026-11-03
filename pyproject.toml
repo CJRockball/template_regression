@@ -49,7 +49,7 @@ dependencies = [
     "plotly>=6,<7",
     "dash-ag-grid>=33",
     "pyyaml>=6.0.3",
-
+    "xlrd >= 2.0.1",
 ]
  
 # Optional model libraries. Install with: uv sync --extra lgbm --extra catboost

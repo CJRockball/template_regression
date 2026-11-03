@@ -3843,6 +3843,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "statsmodels" },
     { name = "xgboost" },
+    { name = "xlrd" },
 ]
 
 [package.optional-dependencies]
@@ -3887,6 +3888,7 @@ requires-dist = [
     { name = "statsmodels", specifier = ">=0.14" },
     { name = "torch", marker = "extra == 'pytorch'", specifier = "==2.9.1+cu126", index = "https://download.pytorch.org/whl/cu126" },
     { name = "xgboost", specifier = "==2.1.1" },
+    { name = "xlrd", specifier = ">=2.0.1" },
 ]
 provides-extras = ["pytorch", "lgbm", "catboost"]
 
@@ -4181,6 +4183,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/65/8e/3971d9b26dbf419a62d77f7b577281f950d6d8d0defdab0c4b61bb02c4ae/xgboost-2.1.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:8f3246a6d839dceb4553d3e5ea64ed718f9c692f072ee8275eeb895b58e283e6", size = 4200376, upload-time = "2024-07-31T08:14:44.972Z" },
     { url = "https://files.pythonhosted.org/packages/20/2f/2ccc91db71096cdb8c5174948db738075d7e38cfece0815500336f6e4ca8/xgboost-2.1.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:6475ca35dede1f87d1dc485b362caba08f69f6020f4440e97b167676a533850e", size = 153883159, upload-time = "2024-07-31T08:24:53.853Z" },
     { url = "https://files.pythonhosted.org/packages/e2/7b/8c1b410cd0604cee9a167a19f7e1746f5b92ae7d02ad574ab560b73c5a48/xgboost-2.1.1-py3-none-win_amd64.whl", hash = "sha256:fcf8413f3c621e97fdaaa45abb7ae808319c88eff5447328eff14c419c7c6ae0", size = 124902746, upload-time = "2024-07-31T08:28:01.68Z" },
+]
+
+[[package]]
+name = "xlrd"
+version = "2.0.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/07/5a/377161c2d3538d1990d7af382c79f3b2372e880b65de21b01b1a2b78691e/xlrd-2.0.2.tar.gz", hash = "sha256:08b5e25de58f21ce71dc7db3b3b8106c1fa776f3024c54e45b45b374e89234c9", size = 100167, upload-time = "2025-06-14T08:46:39.039Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/62/c8d562e7766786ba6587d09c5a8ba9f718ed3fa8af7f4553e8f91c36f302/xlrd-2.0.2-py2.py3-none-any.whl", hash = "sha256:ea762c3d29f4cca48d82df517b6d89fbce4db3107f9d78713e48cd321d5c9aa9", size = 96555, upload-time = "2025-06-14T08:46:37.766Z" },
 ]
 
 [[package]]
