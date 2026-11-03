@@ -1,0 +1,245 @@
+# Bronze dataset configuration and contract
+project:
+  name: kaggle_s6e11_credit_card_fraud
+  description: Kaggle competition s6r11 on credit card fraud
+
+data_paths:
+  database: data/project.db
+  raw_data: data/raw
+  processed_data: data/processed
+  artifacts: artifacts
+  logs: logs
+
+data:
+  adapter: None
+  source: data/raw/combined.csv
+  format: csv
+  entity_id: id
+  target: is_fraud
+  task: binary_classification
+  positive_label: 1
+
+# Minimal technical & structural contract for Bronze ingestion
+bronze_source_contract:
+  rows: 719960
+  columns: 27
+  col_names:
+    - "id"
+    - "account_balance_usd"
+    - "amount_usd"
+    - "auth_method"
+    - "billing_shipping_mismatch"
+    - "card_age_months"
+    - "card_type"
+    - "channel"
+    - "customer_age"
+    - "cvv_retry_count"
+    - "day_of_week"
+    - "device_type"
+    - "distance_from_home_km"
+    - "hours_since_last_txn"
+    - "ip_country_mismatch"
+    - "is_ai_generated_scam_attempt"
+    - "is_foreign_transaction"
+    - "is_fraud"
+    - "is_new_merchant"
+    - "merchant_category"
+    - "merchant_risk_score"
+    - "prior_disputes"
+    - "time_of_day_hour"
+    - "txn_count_last_24h"
+    - "used_vpn"
+    - "velocity_score"
+    - "data_type"
+
+  # Semantic column role classification for column_registry
+  roles:
+    id: ["id"]
+    feature:
+      - "account_balance_usd"
+      - "amount_usd"
+      - "auth_method"
+      - "billing_shipping_mismatch"
+      - "card_age_months"
+      - "card_type"
+      - "channel"
+      - "customer_age"
+      - "cvv_retry_count"
+      - "day_of_week"
+      - "device_type"
+      - "distance_from_home_km"
+      - "hours_since_last_txn"
+      - "ip_country_mismatch"
+      - "is_ai_generated_scam_attempt"
+      - "is_foreign_transaction"
+      - "is_new_merchant"
+      - "merchant_category"
+      - "merchant_risk_score"
+      - "prior_disputes"
+      - "time_of_day_hour"
+      - "txn_count_last_24h"
+      - "used_vpn"
+      - "velocity_score"
+    target: ["is_fraud"]
+
+# Business-level validation (enforced downstream in Silver / EDA)
+validation:
+  required_columns:
+    - "id"
+    - "account_balance_usd"
+    - "amount_usd"
+    - "auth_method"
+    - "billing_shipping_mismatch"
+    - "card_age_months"
+    - "card_type"
+    - "channel"
+    - "customer_age"
+    - "cvv_retry_count"
+    - "day_of_week"
+    - "device_type"
+    - "distance_from_home_km"
+    - "hours_since_last_txn"
+    - "ip_country_mismatch"
+    - "is_ai_generated_scam_attempt"
+    - "is_foreign_transaction"
+    - "is_fraud"
+    - "is_new_merchant"
+    - "merchant_category"
+    - "merchant_risk_score"
+    - "prior_disputes"
+    - "time_of_day_hour"
+    - "txn_count_last_24h"
+    - "used_vpn"
+    - "velocity_score"
+    - "data_type"
+  allowed_target_values: [0,1]
+  require_unique_entity_id: true
+  max_missing_rate: 0.1
+
+# silver contract from eda
+silver_eda_contract:
+  canonical_names:
+    "id": "id"
+    "account_balance_usd": "account_balance_usd"
+    "amount_usd": "amount_usd"
+    "auth_method": "auth_method"
+    "billing_shipping_mismatch": "billing_shipping_mismatch"
+    "card_age_months": "card_age_months"
+    "card_type": "card_type"
+    "channel": "channel"
+    "customer_age": "customer_age"
+    "cvv_retry_count": "cvv_retry_count"
+    "day_of_week": "day_of_week"
+    "device_type": "device_type"
+    "distance_from_home_km": "distance_from_home_km"
+    "hours_since_last_txn": "hours_since_last_txn"
+    "ip_country_mismatch": "ip_country_mismatch"
+    "is_ai_generated_scam_attempt": "is_ai_generated_scam_attempt"
+    "is_foreign_transaction": "is_foreign_transaction"
+    "is_fraud": "is_fraud"
+    "is_new_merchant": "is_new_merchant"
+    "merchant_category": "merchant_category"
+    "merchant_risk_score": "merchant_risk_score"
+    "prior_disputes": "prior_disputes"
+    "time_of_day_hour": "time_of_day_hour"
+    "txn_count_last_24h": "txn_count_last_24h"
+    "used_vpn": "used_vpn"
+    "velocity_score": "velocity_score"
+    "data_type": "data_type"
+
+  canonical_dtypes:
+    "id": Int64
+    "account_balance_usd": float64
+    "amount_usd": float64
+    "auth_method": string
+    "billing_shipping_mismatch": int8
+    "card_age_months": int16
+    "card_type": string
+    "channel": string
+    "customer_age": int16
+    "cvv_retry_count": int16
+    "day_of_week": int8
+    "device_type": string
+    "distance_from_home_km": float64
+    "hours_since_last_txn": float64
+    "ip_country_mismatch": int8
+    "is_ai_generated_scam_attempt": int8
+    "is_foreign_transaction": int8
+    "is_fraud": int8
+    "is_new_merchant": int8
+    "merchant_category": string
+    "merchant_risk_score": float64
+    "prior_disputes": int16
+    "time_of_day_hour": int8
+    "txn_count_last_24h": int16
+    "used_vpn": int8
+    "velocity_score": float64
+    "data_type": string
+
+  feature_types:
+    numerical:
+      - account_balance_usd
+      - amount_usd
+      - card_age_months
+      - customer_age
+      - cvv_retry_count
+      - distance_from_home_km
+      - hours_since_last_txn
+      - merchant_risk_score
+      - prior_disputes
+      - txn_count_last_24h
+      - velocity_score
+
+    nominal:
+      - auth_method
+      - billing_shipping_mismatch
+      - card_type
+      - channel
+      - day_of_week
+      - device_type
+      - ip_country_mismatch
+      - is_ai_generated_scam_attempt
+      - is_foreign_transaction
+      - is_new_merchant
+      - merchant_category
+      - time_of_day_hour
+      - used_vpn
+
+    ordinal: []
+
+  allowed_values:
+    is_fraud: [0, 1]
+    billing_shipping_mismatch: [0, 1]
+    ip_country_mismatch: [0, 1]
+    is_ai_generated_scam_attempt: [0, 1]
+    is_foreign_transaction: [0, 1]
+    is_new_merchant: [0, 1]
+    used_vpn: [0, 1]
+    day_of_week: [0, 1, 2, 3, 4, 5, 6]
+    time_of_day_hour: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+                       10, 11, 12, 13, 14, 15, 16, 17,
+                       18, 19, 20, 21, 22, 23]
+
+  value_mappings:
+    billing_shipping_mismatch:
+      "False": 0
+      "True": 1
+    ip_country_mismatch:
+      "False": 0
+      "True": 1
+    is_ai_generated_scam_attempt:
+      "False": 0
+      "True": 1
+    is_foreign_transaction:
+      "False": 0
+      "True": 1
+    is_new_merchant:
+      "False": 0
+      "True": 1
+    used_vpn:
+      "False": 0
+      "True": 1
+
+  missingness:
+    default_max_rate: 0.0
+    max_rate_by_column: {}

@@ -1,0 +1,18 @@
+# Default XGBoost parameters. Experiment files override single keys.
+# n_estimators is a cap: early stopping decides how many rounds are kept.
+type: xgb
+params:
+  objective: binary:logistic
+  eval_metric: auc  # watched by early stopping (prauc or auc or logloss)
+  n_estimators: 5000
+  early_stopping_rounds: 50
+  max_depth: 10
+  learning_rate: 0.03
+  subsample: 0.8
+  colsample_bytree: 0.75
+  min_child_weight: 20
+  reg_lambda: 0.1
+  reg_alpha: 2.0
+  max_bin: 256
+  scale_pos_weight: auto  # auto = negatives / positives of the rows being fitted
+  device: cpu  # cpu or cuda
