@@ -30,7 +30,16 @@ class ModelAdapter(Protocol):
     def save(self, path: Path) -> None: ...
 
 
-AdapterFactory = Callable[[], ModelAdapter]
+class RegressionAdapter(Protocol):
+    max_rounds: int
+
+    def fit_with_validation(self, X_train, y_train, X_val, y_val) -> int: ...
+    def refit(self, X, y, n_rounds: int) -> None: ...
+    def predict(self, X: pd.DataFrame) -> np.ndarray: ...
+    def save(self, path: Path) -> None: ...
+
+
+AdapterFactory = Callable[[], ModelAdapter | RegressionAdapter]
 
 
 def prepare_features(X: pd.DataFrame) -> pd.DataFrame:
@@ -48,8 +57,14 @@ def prepare_features(X: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _adapter_class(model_type: str) -> type:
+def _adapter_class(model_type: str, task: str = "binary_classification") -> type:
     """The adapter class for a model type. Imports only the library that is needed."""
+    if task == "regression":
+        if model_type != "xgb":
+            raise ValueError("Only XGB regression is implemented")
+        from ml_template.models.xgb_regressor import XGBRegressionAdapter
+
+        return XGBRegressionAdapter
     if model_type == "xgb":
         from ml_template.models.xgb_classifier import XGBAdapter
 
@@ -71,7 +86,7 @@ def _adapter_class(model_type: str) -> type:
 
 def build_adapter_factory(cfg: RunConfig) -> AdapterFactory:
     """Return a callable that makes a fresh, unfitted adapter for this config."""
-    adapter_class = _adapter_class(cfg.model.type)
+    adapter_class = _adapter_class(cfg.model.type, cfg.task)
 
     def base() -> ModelAdapter:
         return adapter_class(cfg.model.params, cfg.seed)
@@ -84,7 +99,7 @@ def build_adapter_factory(cfg: RunConfig) -> AdapterFactory:
 
 
 def load_adapter(cfg: RunConfig, path: Path) -> ModelAdapter:
-    inner = _adapter_class(cfg.model.type).load(cfg.model.params, cfg.seed, path)
+    inner = _adapter_class(cfg.model.type, cfg.task).load(cfg.model.params, cfg.seed, path)
     if not cfg.fitted_features:
         return inner
     from ml_template.features.fitted_features import TransformingAdapter

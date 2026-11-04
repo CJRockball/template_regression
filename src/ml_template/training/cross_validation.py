@@ -53,13 +53,17 @@ def _check_alignment(
 
 
 def inner_split(
-    train_keys: np.ndarray, y: pd.Series, fraction: float, seed: int
+    train_keys: np.ndarray,
+    y: pd.Series,
+    fraction: float,
+    seed: int,
+    task: str = "binary_classification",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Stratified split of a fold's training keys into fit and early-stopping slices."""
     fit_keys, stop_keys = train_test_split(
         train_keys,
         test_size=fraction,
-        stratify=y.loc[train_keys].to_numpy(),
+        stratify=y.loc[train_keys].to_numpy() if task == "binary_classification" else None,
         random_state=seed,
     )
     return fit_keys, stop_keys
@@ -77,7 +81,11 @@ def cross_validate(
     metric_names: list[str],
     alert_rates: list[float],
     refit_rounds_factor: float = 1.0,
+    task: str = "binary_classification",
 ) -> CVResult:
+    if task not in {"binary_classification", "regression"}:
+        raise ValueError(f"Unsupported task: {task!r}")
+    prediction_col = "y_pred_oof" if task == "regression" else "p_oof"
     _check_alignment(X, y, assignments, key_col)
     dev = assignments[assignments["partition"] == "dev"]
     fold_ids = sorted(int(k) for k in dev["fold"].unique())
@@ -91,8 +99,13 @@ def cross_validate(
     for k in fold_ids:
         val_keys = dev.loc[dev["fold"] == k, key_col].to_numpy()
         train_keys = dev.loc[dev["fold"] != k, key_col].to_numpy()
-        fit_keys, stop_keys = inner_split(train_keys, y, validation_fraction, seed)
-        if y.loc[stop_keys].sum() == 0 or y.loc[fit_keys].sum() == 0:
+        if task == "regression":
+            fit_keys, stop_keys = inner_split(train_keys, y, validation_fraction, seed, task=task)
+        else:
+            fit_keys, stop_keys = inner_split(train_keys, y, validation_fraction, seed)
+        if task == "binary_classification" and (
+            y.loc[stop_keys].sum() == 0 or y.loc[fit_keys].sum() == 0
+        ):
             raise ValueError(f"fold {k}: inner split has a slice without positives")
 
         stopper: ModelAdapter = make_adapter()
@@ -109,8 +122,15 @@ def cross_validate(
 
         fitter: ModelAdapter = make_adapter()
         fitter.refit(X.loc[train_keys], y.loc[train_keys], best_round)
-        p = fitter.predict_proba(X.loc[val_keys])
-        oof_parts.append(pd.DataFrame({key_col: val_keys, "fold": k, "p_oof": p}))
+        p = (
+            fitter.predict(X.loc[val_keys])
+            if task == "regression"
+            else fitter.predict_proba(X.loc[val_keys])
+        )
+        p = np.asarray(p)
+        if p.shape != (len(val_keys),) or not np.isfinite(p).all():
+            raise ValueError("Invalid validation predictions")
+        oof_parts.append(pd.DataFrame({key_col: val_keys, "fold": k, prediction_col: p}))
         fold_models[k] = fitter
         fold_val_keys[k] = val_keys
         fold_rows.append(
@@ -129,16 +149,22 @@ def cross_validate(
     oof = pd.concat(oof_parts, ignore_index=True)
     folds = pd.DataFrame(fold_rows)
     y_oof = y.loc[oof[key_col]].to_numpy()
-    rows = long_form_metrics(
-        y_oof,
-        oof["p_oof"].to_numpy(),
-        metric_names,
-        alert_rates,
-        split="cv",
-        folds=oof["fold"].to_numpy(),
-    )
-    rows += fold_stability_rows(rows, resolved_keys(metric_names, alert_rates))
-    rows += label_summary_rows(y_oof, split="cv")
+    if task == "regression":
+        from ml_template.evaluation.regression_metrics import regression_metric_rows
+
+        rows = regression_metric_rows(y_oof, oof[prediction_col].to_numpy(), oof["fold"].to_numpy())
+        rows += fold_stability_rows(rows, ["rmse", "mae", "r2"])
+    else:
+        rows = long_form_metrics(
+            y_oof,
+            oof["p_oof"].to_numpy(),
+            metric_names,
+            alert_rates,
+            split="cv",
+            folds=oof["fold"].to_numpy(),
+        )
+        rows += fold_stability_rows(rows, resolved_keys(metric_names, alert_rates))
+        rows += label_summary_rows(y_oof, split="cv")
 
     n_final = max(1, round(float(np.median(folds["best_round"])) * refit_rounds_factor))
     rows += [

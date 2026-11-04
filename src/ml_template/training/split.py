@@ -89,7 +89,8 @@ def make_split(df: pd.DataFrame, cfg: SplitConfig, key_col: str, target_col: str
         raise ValueError(f"Unsupported split method: {cfg.method!r}")
     idx = np.arange(len(data))
     dev_idx, _ = train_test_split(
-        idx, test_size=cfg.holdout_fraction,
+        idx,
+        test_size=cfg.holdout_fraction,
         stratify=y if cfg.method == "stratified" else None,
         random_state=cfg.seed,
     )
@@ -111,12 +112,13 @@ def make_split(df: pd.DataFrame, cfg: SplitConfig, key_col: str, target_col: str
                     f"{name} has {positives} positives (minimum {MIN_POSITIVES}); "
                     "reduce n_folds or holdout_fraction"
                 )
-    return pd.DataFrame({
-        key_col: data[key_col].to_numpy(),
-        "partition": np.where(fold == HOLDOUT_FOLD, "holdout", "dev"),
-        "fold": fold,
-    })
-
+    return pd.DataFrame(
+        {
+            key_col: data[key_col].to_numpy(),
+            "partition": np.where(fold == HOLDOUT_FOLD, "holdout", "dev"),
+            "fold": fold,
+        }
+    )
 
 
 def _assignments_sha256(assignments: pd.DataFrame) -> str:

@@ -38,13 +38,17 @@ def test_binary_unchanged():
     cfg = SplitConfig()
     a = make_split(df, cfg, "id", "y")
     y = df.y.to_numpy()
-    dev, _ = train_test_split(np.arange(len(df)), test_size=.2, stratify=y, random_state=42)
+    dev, _ = train_test_split(np.arange(len(df)), test_size=0.2, stratify=y, random_state=42)
     dev = np.sort(dev)
     expected = np.full(len(df), -1)
-    for k, (_, val) in enumerate(StratifiedKFold(5, shuffle=True, random_state=42).split(dev, y[dev])):
+    for k, (_, val) in enumerate(
+        StratifiedKFold(5, shuffle=True, random_state=42).split(dev, y[dev])
+    ):
         expected[dev[val]] = k
     np.testing.assert_array_equal(a.fold, expected)
-    assert compute_split_id("s", cfg, "id", "y") != compute_split_id("s", SplitConfig(method="random"), "id", "y")
+    assert compute_split_id("s", cfg, "id", "y") != compute_split_id(
+        "s", SplitConfig(method="random"), "id", "y"
+    )
 
 
 def test_manifest_reuse(tmp_path):

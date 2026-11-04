@@ -45,7 +45,11 @@ def load_run_inputs(
 ) -> RunInputs:
     contract = load_dataset_contract(resolve_path(cfg.data.dataset_config))
     silver = load_silver(
-        cfg.data.silver_dataset_version_id, cfg.data.dataset_name, contract.entity_id, silver_root
+        cfg.data.silver_dataset_version_id,
+        cfg.data.dataset_name,
+        contract.entity_id,
+        silver_root,
+        task=cfg.task,
     )
     if silver.target != contract.target or set(silver.features) != set(contract.features):
         raise ValueError(
@@ -63,7 +67,24 @@ def load_run_inputs(
             cfg.data.feature_set_id, raw, silver.silver_dataset_version_id, feature_root
         )
     X = prepare_features(raw)
-    y = frame[silver.target].astype(int)
+    import numpy as np
+    import yaml
+
+    raw_contract = yaml.safe_load(resolve_path(cfg.data.dataset_config).read_text(encoding="utf-8"))
+    contract_task = raw_contract.get("data", {}).get("task", "binary_classification")
+    if contract_task != cfg.task:
+        raise ValueError("Experiment task disagrees with dataset contract")
+    target = frame[silver.target]
+    if cfg.task == "regression":
+        if not pd.api.types.is_numeric_dtype(target) or pd.api.types.is_bool_dtype(target):
+            raise ValueError("Regression target must be numeric")
+        y = target.astype(float)
+        if not np.isfinite(y.to_numpy()).all():
+            raise ValueError("Regression target must be finite")
+    else:
+        if target.isna().any() or not target.isin([0, 1]).all():
+            raise ValueError("Binary target must be 0/1 without nulls")
+        y = target.astype(int)
     if set(assignments[contract.entity_id]) != set(frame.index):
         raise ValueError(
             f"split {split_id} does not cover the rows of {silver.silver_dataset_version_id}"

@@ -145,6 +145,7 @@ def _train_and_record(
         metric_names=cfg.metrics.names,
         alert_rates=cfg.metrics.alert_rates,
         refit_rounds_factor=cfg.training.refit_rounds_factor,
+        **({"task": cfg.task} if cfg.task == "regression" else {}),
     )
     final = fit_final(
         make_adapter, inputs.X, inputs.y, inputs.assignments, key_col, cv.n_rounds_final
@@ -178,7 +179,19 @@ def _train_and_record(
     )
 
     registry.log_metrics(engine, run_id, cv.metric_rows)
-    _run_analyses(cfg, engine, run_id, run_dir, inputs, cv, make_adapter)
+    if cfg.task == "regression":
+        run_artifacts.write_json(
+            run_dir / "task.json",
+            {
+                "task": cfg.task,
+                "prediction_column": "y_pred_oof",
+                "primary_metric": cfg.metrics.primary,
+                "metric_direction": "min",
+                "unsupported": ["evaluation", "calibration", "release", "scoring", "analyses"],
+            },
+        )
+    else:
+        _run_analyses(cfg, engine, run_id, run_dir, inputs, cv, make_adapter)
 
     primary = next(
         r["value"]
