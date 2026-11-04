@@ -21,11 +21,11 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
 from ml_template.data.contract import load_dataset_contract
 from ml_template.paths import DATA_SILVER, DATA_SPLITS
-from ml_template.training.run_config import SplitConfig, load_config, resolve_path
+from ml_template.training.run_config import SplitConfig, resolve_path
 
 logger = logging.getLogger("ml_template.training.split")
 
@@ -62,50 +62,61 @@ def compute_split_id(
 
 
 def make_split(df: pd.DataFrame, cfg: SplitConfig, key_col: str, target_col: str) -> pd.DataFrame:
-    """Return assignments with columns [key_col, partition, fold], sorted by key."""
+    """Stable keyed assignments; random is reserved for numeric regression."""
     for col in (key_col, target_col):
         if col not in df.columns:
             raise KeyError(f"column {col!r} not in data")
     data = df[[key_col, target_col]].sort_values(key_col).reset_index(drop=True)
+    if data[key_col].isna().any():
+        raise ValueError(f"{key_col} contains nulls")
+
     if data[key_col].duplicated().any():
         raise ValueError(f"{key_col} is not unique")
-    if data[target_col].isna().any() or not data[target_col].isin([0, 1]).all():
-        raise ValueError(f"{target_col} must be binary 0/1 with no nulls")
-
-    y = data[target_col].to_numpy().astype(int)
+    target = data[target_col]
+    if target.isna().any():
+        raise ValueError(f"{target_col} must have no nulls")
+    if cfg.method == "stratified":
+        if not target.isin([0, 1]).all():
+            raise ValueError(f"{target_col} must be binary 0/1 with no nulls")
+        y = target.to_numpy().astype(int)
+    elif cfg.method == "random":
+        if not pd.api.types.is_numeric_dtype(target) or pd.api.types.is_bool_dtype(target):
+            raise ValueError(f"{target_col} must be numeric for regression")
+        y = target.to_numpy(dtype=float)
+        if not np.isfinite(y).all():
+            raise ValueError(f"{target_col} must be finite")
+    else:
+        raise ValueError(f"Unsupported split method: {cfg.method!r}")
     idx = np.arange(len(data))
     dev_idx, _ = train_test_split(
-        idx, test_size=cfg.holdout_fraction, stratify=y, random_state=cfg.seed
+        idx, test_size=cfg.holdout_fraction,
+        stratify=y if cfg.method == "stratified" else None,
+        random_state=cfg.seed,
     )
     dev_idx = np.sort(dev_idx)
-
+    if len(dev_idx) < cfg.n_folds:
+        raise ValueError("Development rows must be at least n_folds")
     fold = np.full(len(data), HOLDOUT_FOLD, dtype=int)
     cv_seed = cfg.seed if cfg.cv_seed is None else cfg.cv_seed
-
-    skf = StratifiedKFold(
-        n_splits=cfg.n_folds,
-        shuffle=True,
-        random_state=cv_seed,
-    )
-    for k, (_, val) in enumerate(skf.split(dev_idx, y[dev_idx])):
+    splitter_cls = StratifiedKFold if cfg.method == "stratified" else KFold
+    splitter = splitter_cls(n_splits=cfg.n_folds, shuffle=True, random_state=cv_seed)
+    for k, (_, val) in enumerate(splitter.split(dev_idx, y[dev_idx])):
         fold[dev_idx[val]] = k
+    if cfg.method == "stratified":
+        for k in [HOLDOUT_FOLD, *range(cfg.n_folds)]:
+            positives = int(y[fold == k].sum())
+            if positives < MIN_POSITIVES:
+                name = "holdout" if k == HOLDOUT_FOLD else f"fold {k}"
+                raise ValueError(
+                    f"{name} has {positives} positives (minimum {MIN_POSITIVES}); "
+                    "reduce n_folds or holdout_fraction"
+                )
+    return pd.DataFrame({
+        key_col: data[key_col].to_numpy(),
+        "partition": np.where(fold == HOLDOUT_FOLD, "holdout", "dev"),
+        "fold": fold,
+    })
 
-    for k in [HOLDOUT_FOLD, *range(cfg.n_folds)]:
-        positives = int(y[fold == k].sum())
-        if positives < MIN_POSITIVES:
-            name = "holdout" if k == HOLDOUT_FOLD else f"fold {k}"
-            raise ValueError(
-                f"{name} has {positives} positives (minimum {MIN_POSITIVES}); "
-                "reduce n_folds or holdout_fraction"
-            )
-
-    return pd.DataFrame(
-        {
-            key_col: data[key_col].to_numpy(),
-            "partition": np.where(fold == HOLDOUT_FOLD, "holdout", "dev"),
-            "fold": fold,
-        }
-    )
 
 
 def _assignments_sha256(assignments: pd.DataFrame) -> str:
@@ -138,9 +149,15 @@ def _manifest(
         "created_at": datetime.now(UTC).isoformat(),
     }
     if target is not None:
-        y = target.to_numpy().astype(int)
-        manifest["n_positive_total"] = int(y.sum())
-        manifest["n_positive_holdout"] = int(y[hold].sum())
+        if len(target) != len(assignments):
+            raise ValueError("Target must align with sorted assignments")
+        if cfg.method == "stratified":
+            y = target.to_numpy().astype(int)
+            manifest["n_positive_total"] = int(y.sum())
+            manifest["n_positive_holdout"] = int(y[hold].sum())
+        else:
+            manifest["task"] = "regression"
+            manifest["target_dtype"] = str(target.dtype)
     return manifest
 
 
@@ -221,6 +238,36 @@ def register_split(engine: Any, split_id: str, path: Path, manifest: dict[str, A
         conn.execute(stmt)
 
 
+def _load_split_config(path: Path):
+    """Validate split inputs without validating an unimplemented regressor."""
+    from types import SimpleNamespace
+
+    import yaml
+
+    from ml_template.training.run_config import DataConfig
+
+    resolved = resolve_path(path)
+    raw = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Experiment must be a YAML mapping")
+    data = DataConfig.model_validate(raw.get("data", {}))
+    split = SplitConfig.model_validate(raw.get("split", {}))
+    contract_path = resolve_path(data.dataset_config)
+    contract_raw = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    task = contract_raw.get("data", {}).get("task", "binary_classification")
+    expected = {"binary_classification": "stratified", "regression": "random"}
+    if task not in expected:
+        raise ValueError(f"Unsupported task: {task!r}")
+    if split.method != expected[task]:
+        raise ValueError(f"Task {task!r} requires split.method={expected[task]!r}")
+    declared = raw.get("task", task)
+    if isinstance(declared, dict):
+        declared = declared.get("kind")
+    if declared != task:
+        raise ValueError("Experiment task disagrees with dataset contract")
+    return SimpleNamespace(data=data, split=split)
+
+
 def main(argv: list[str] | None = None) -> None:
     from ml_template.db.connection import get_engine
     from ml_template.tracking.pipeline_logging import setup_logging
@@ -233,7 +280,7 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
 
     setup_logging()
-    cfg = load_config(args.config)
+    cfg = _load_split_config(args.config)
     contract = load_dataset_contract(resolve_path(cfg.data.dataset_config))
     key_col, target_col = contract.entity_id, contract.target
     silver_id = args.silver_version_id or cfg.data.silver_dataset_version_id

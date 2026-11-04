@@ -53,7 +53,7 @@ class DataConfig(_Strict):
 class SplitConfig(_Strict):
     """Holdout policy and development-only CV-fold policy."""
 
-    method: Literal["stratified"] = "stratified"
+    method: Literal["stratified", "random"] = "stratified"
     holdout_fraction: float = Field(0.2, gt=0, lt=1)
     n_folds: int = Field(5, ge=2)
 
