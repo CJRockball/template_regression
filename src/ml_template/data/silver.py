@@ -107,7 +107,6 @@ def check_gates(df: pd.DataFrame, roles: dict, config: dict) -> list[dict]:
     names = list(contract["canonical_names"].values())
     dtypes = contract["canonical_dtypes"]
     expected_rows = int(config["bronze_source_contract"]["rows"])
-    binary_cols = list(roles["target"])
 
     results: list[dict] = []
 
@@ -143,11 +142,31 @@ def check_gates(df: pd.DataFrame, roles: dict, config: dict) -> list[dict]:
     }
     add("declared_dtypes", not bad_dtypes, f"mismatches={bad_dtypes}")
 
-    bad_binary = {
-        c: sorted(set(df[c].dropna().unique()) - {0, 1}) for c in binary_cols if c in df.columns
-    }
-    bad_binary = {c: v for c, v in bad_binary.items() if v}
-    add("binary_fields_in_0_1", not bad_binary, f"violations={bad_binary}")
+    task = config.get("data", {}).get("task", "binary_classification")
+
+    if task == "binary_classification":
+        bad_binary = {
+            c: sorted(set(df[c].dropna().unique()) - {0, 1})
+            for c in roles["target"]
+            if c in df.columns
+        }
+        bad_binary = {c: v for c, v in bad_binary.items() if v}
+        add(
+            "binary_fields_in_0_1",
+            not bad_binary,
+            f"violations={bad_binary}",
+        )
+    elif task == "regression":
+        for col in roles["target"]:
+            if col in df.columns:
+                add(
+                    f"target_numeric:{col}",
+                    pd.api.types.is_numeric_dtype(df[col])
+                    and not pd.api.types.is_bool_dtype(df[col]),
+                    f"dtype={df[col].dtype}",
+                )
+    else:
+        raise ValueError(f"Unsupported task: {task!r}")
 
     allowed_values = contract.get("allowed_values", {})
 
