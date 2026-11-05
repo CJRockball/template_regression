@@ -147,3 +147,15 @@ class ReleasedPredictor:
             out["policy_flag"] = flags
         out["release_id"] = self.release_id
         return out
+
+    def __new__(cls, directory=None, *, expected_release_id=None):
+        if cls is ReleasedPredictor and directory is not None:
+            verify(directory, expected_release_id)
+            info = read_json(Path(directory) / "release.json")
+            if info.get("task") == "regression":
+                from ml_template.scoring.regression_predictor import RegressionReleasedPredictor
+
+                return RegressionReleasedPredictor(
+                    directory, expected_release_id=expected_release_id
+                )
+        return object.__new__(cls)

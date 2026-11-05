@@ -240,11 +240,9 @@ def evaluate_spec(
             "base_rate": float(y.mean()),
             "primary_metric": cfg.primary_metric,
             "primary_value": next(
-
-                    r["value"]
-                    for r in metrics
-                    if r["variant"] == cfg.release_variant and r["metric"] == cfg.primary_metric
-
+                r["value"]
+                for r in metrics
+                if r["variant"] == cfg.release_variant and r["metric"] == cfg.primary_metric
             ),
             "criteria_status": acceptance["status"],
             "prior_exposure": bool(prior),

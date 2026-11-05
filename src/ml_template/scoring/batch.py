@@ -131,6 +131,13 @@ def _score_batch(
                 "batch_metadata": batch_metadata or {},
                 "timings": {"prediction_s": prediction_duration},
             }
+            if predictor.info.get("task") == "regression":
+                summary.update(
+                    schema_version=2,
+                    task="regression",
+                    prediction_kind="continuous",
+                    prediction_columns=predictor.info["prediction_columns"],
+                )
             write_json(directory / "summary.json", summary)
             write_json(
                 directory / "artifacts.json",

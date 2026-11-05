@@ -121,6 +121,10 @@ def _source_frames(prepared):
 
 
 def prepare_release(engine, request):
+    if getattr(request, "task", None) == "regression":
+        from ml_template.scoring.regression_release import prepare_regression_release
+
+        return prepare_regression_release(engine, request)
     from ml_template.features.feature_recipe import export_recipe, replay_recipe
     from ml_template.models.model_factory import prepare_features
 
@@ -149,10 +153,10 @@ def prepare_release(engine, request):
         raise ValueError("saved model feature order changed")
     key_values = source.index.to_series()
     is_int = key_values.map(
-        lambda v: isinstance(v, (int, np.integer)) and not isinstance(v, (bool, np.bool_))
+        lambda v: isinstance(v, (int, np.integer)) and (not isinstance(v, (bool, np.bool_)))
     ).all()
     is_str = key_values.map(lambda v: isinstance(v, str)).all()
-    if not is_int and not is_str:
+    if not is_int and (not is_str):
         raise ValueError("only homogeneous integer or string entity keys supported")
     contract = build_pre_gold_contract(
         source,
@@ -250,8 +254,14 @@ def _check_parity(predictor, material, atol):
 
 
 def build_release(engine, request, *, check_only=False, output_root=None):
+    if getattr(request, "task", None) == "regression":
+        from ml_template.scoring.regression_release import build_regression_release
+
+        return build_regression_release(
+            engine, request, check_only=check_only, output_root=output_root
+        )
     material = prepare_release(engine, request)
-    spec, prepared = material["spec"], material["prepared"]
+    spec, prepared = (material["spec"], material["prepared"])
     if check_only:
         return {
             "ready": True,

@@ -27,4 +27,9 @@ class ReleaseConfig(BaseModel):
 
 
 def load_release_config(path):
-    return ReleaseConfig.model_validate(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and raw.get("task") == "regression":
+        from ml_template.scoring.regression_release_config import RegressionReleaseConfig
+
+        return RegressionReleaseConfig.model_validate(raw)
+    return ReleaseConfig.model_validate(raw)
