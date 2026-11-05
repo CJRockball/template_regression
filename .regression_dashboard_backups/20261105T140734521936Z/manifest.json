@@ -1,0 +1,30 @@
+{
+  "src/ml_template/dashboard/regression_data.py": {
+    "existed": false,
+    "installed_sha256": "362c19eae6c5b95f901f709fcd298d6bb0e91badf25b6d06fb43a2a1e6585ac1"
+  },
+  "src/ml_template/dashboard/regression_figs.py": {
+    "existed": false,
+    "installed_sha256": "273cfad46ee305846fc199d4328b942e0e13038d8cd2c149e7a13b3999194e27"
+  },
+  "src/ml_template/dashboard/pages/regression_run_page.py": {
+    "existed": false,
+    "installed_sha256": "e5f432d29d55eaa5dbff76ccbbcb08689d5856b56bbb56afc3a6b1a4ecc4737c"
+  },
+  "tests/dashboard/test_regression_artifact_view.py": {
+    "existed": false,
+    "installed_sha256": "8d8ae69436875099549a428cbf86d09376e1a10789a342bf6a3a70cfee9e27a8"
+  },
+  "tests/dashboard/test_regression_page_smoke.py": {
+    "existed": false,
+    "installed_sha256": "75f1c638de69f8cfa61e2da3a2117ee637edfe3bf289a62c46dee6ffa4ed6f2e"
+  },
+  "src/ml_template/dashboard/pages/run_page.py": {
+    "existed": true,
+    "installed_sha256": "185daab09deca7bf5b9480fa2465bfa16a9172f1a02c464903c70803a8384f4e"
+  },
+  "src/ml_template/dashboard/run_data.py": {
+    "existed": true,
+    "installed_sha256": "20283e53cea2a4f03c626cd1c173d514dbe6291dbe257e1b8c2f90c1a0cfb6b5"
+  }
+}
