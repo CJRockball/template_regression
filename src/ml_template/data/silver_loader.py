@@ -120,10 +120,7 @@ def load_silver(
             raise ValueError(f"target {target!r} must be binary 0/1")
 
     elif task == "regression":
-        if (
-            not pd.api.types.is_numeric_dtype(values)
-            or pd.api.types.is_bool_dtype(values)
-        ):
+        if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
             raise ValueError(f"target {target!r} must be numeric")
 
         numeric = values.to_numpy(dtype=float, na_value=np.nan)

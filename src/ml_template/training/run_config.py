@@ -103,7 +103,7 @@ class AnalysisConfig(_Strict):
     permutation_max_rows: int = Field(50_000, ge=100)  # validation rows used per fold
     error_sample_size: int = Field(25, ge=0)  # rows per kind in error_sample.csv; 0 = off
     learning_curves: bool = False  # per-round train/validation metric table; off by default
-    learning_curve_metric: Literal["logloss", "aucpr", "auc", "error"] = "logloss"
+    learning_curve_metric: Literal["logloss", "aucpr", "auc", "error", "rmse", "mae"] = "logloss"
     learning_curve_rounds: int | None = Field(None, ge=1)  # None = twice each fold's best round
 
 
@@ -230,12 +230,25 @@ class RunConfig(_Strict):
         if isinstance(data, dict) and data.get("task") == "regression":
             data = copy.deepcopy(data)
             data["metrics"] = RegressionMetricsConfig.model_validate(data.get("metrics", {}))
+            raw_model = data.get("model", {})
+            raw_params = (
+                raw_model.get("params", {}) if isinstance(raw_model, dict) else raw_model.params
+            )
+            monitor = (
+                raw_params.get("eval_metric", "rmse")
+                if isinstance(raw_params, dict)
+                else raw_params.eval_metric
+            )
             analysis = {
                 "permutation_importance": False,
                 "error_sample_size": 0,
                 "learning_curves": False,
+                "learning_curve_metric": monitor,
             }
-            analysis.update(data.get("analysis", {}))
+            given = data.get("analysis", {})
+            if not isinstance(given, dict):
+                given = given.model_dump()
+            analysis.update(given)
             data["analysis"] = analysis
             if "split" not in data:
                 data["split"] = {"method": "random"}
@@ -255,11 +268,7 @@ class RunConfig(_Strict):
                 raise ValueError("Use rmse or mae as the initial primary metric; r2 is diagnostic")
             if self.fitted_features:
                 raise ValueError("Regression fitted_features are not supported in this first patch")
-            if (
-                self.analysis.permutation_importance
-                or self.analysis.error_sample_size
-                or self.analysis.learning_curves
-            ):
+            if self.analysis.permutation_importance or self.analysis.error_sample_size:
                 raise ValueError("Regression analyses are not implemented; disable them")
         else:
             if isinstance(self.metrics, RegressionMetricsConfig):
@@ -285,6 +294,18 @@ class RunConfig(_Strict):
 
             validate_specs(v)
         return v
+
+    @model_validator(mode="after")
+    def _curve_metric_compatibility(self):
+        if self.analysis.learning_curves:
+            allowed = (
+                {"rmse", "mae"}
+                if self.task == "regression"
+                else {"logloss", "aucpr", "auc", "error"}
+            )
+            if self.analysis.learning_curve_metric not in allowed:
+                raise ValueError(f"Learning-curve metric incompatible with task {self.task!r}")
+        return self
 
 
 # --- raw YAML handling -------------------------------------------------------

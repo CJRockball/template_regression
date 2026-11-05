@@ -122,7 +122,6 @@ def _train_and_record(
 ) -> dict[str, Any]:
     run_artifacts.write_json(run_dir / "environment.json", run_artifacts.environment_info())
     (run_dir / "config.json").write_text(config_json(cfg), encoding="utf-8")
-
     inputs = load_run_inputs(cfg, silver_root=silver_root, split_root=split_root)
     key_col = inputs.contract.entity_id
     logger.info(
@@ -132,7 +131,6 @@ def _train_and_record(
         inputs.X.shape[1],
         inputs.split_id,
     )
-
     make_adapter = factory_builder(cfg)
     cv = cross_validate(
         make_adapter,
@@ -145,12 +143,11 @@ def _train_and_record(
         metric_names=cfg.metrics.names,
         alert_rates=cfg.metrics.alert_rates,
         refit_rounds_factor=cfg.training.refit_rounds_factor,
-        **({"task": cfg.task} if cfg.task == "regression" else {}),
+        **{"task": cfg.task} if cfg.task == "regression" else {},
     )
     final = fit_final(
         make_adapter, inputs.X, inputs.y, inputs.assignments, key_col, cv.n_rounds_final
     )
-
     final.save(run_dir / "model.ubj")
     fold_dir = run_dir / "fold_models"
     fold_dir.mkdir()
@@ -158,6 +155,9 @@ def _train_and_record(
         adapter.save(fold_dir / f"fold_{fold}.ubj")
     cv.oof.to_parquet(run_dir / "oof_predictions.parquet", index=False)
     cv.folds.to_csv(run_dir / "cv_folds.csv", index=False)
+    from ml_template.evaluation.curve_history import save_inner_history
+
+    save_inner_history(run_dir, cv)
     run_artifacts.write_json(
         run_dir / "features.json",
         {
@@ -177,7 +177,6 @@ def _train_and_record(
             "split_id": inputs.split_id,
         },
     )
-
     registry.log_metrics(engine, run_id, cv.metric_rows)
     if cfg.task == "regression":
         run_artifacts.write_json(
@@ -187,16 +186,25 @@ def _train_and_record(
                 "prediction_column": "y_pred_oof",
                 "primary_metric": cfg.metrics.primary,
                 "metric_direction": "min",
-                "unsupported": ["evaluation", "calibration", "release", "scoring", "analyses"],
+                "unsupported": [
+                    "evaluation",
+                    "calibration",
+                    "release",
+                    "scoring",
+                    "permutation_importance",
+                    "error_samples",
+                ],
             },
         )
+        from ml_template.evaluation.curve_history import run_regression_curve_diagnostics
+
+        run_regression_curve_diagnostics(cfg, run_dir, inputs, cv, make_adapter, logger)
     else:
         _run_analyses(cfg, engine, run_id, run_dir, inputs, cv, make_adapter)
-
     primary = next(
         r["value"]
         for r in cv.metric_rows
-        if r["split"] == "cv" and r["fold"] == -1 and r["metric"] == cfg.metrics.primary
+        if r["split"] == "cv" and r["fold"] == -1 and (r["metric"] == cfg.metrics.primary)
     )
     run_artifacts.write_artifact_manifest(run_dir)
     logger.info(
