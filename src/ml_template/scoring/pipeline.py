@@ -16,7 +16,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 
-def _services():
+def _binary_services():
     from ml_template.db import evaluation_registry, model_run_registry
     from ml_template.evaluation.evaluate_run import evaluate_spec
     from ml_template.evaluation.evaluation_config import EvaluationConfig, load_evaluation_config
@@ -50,7 +50,7 @@ def _services():
     )
 
 
-def _evaluation_spec(
+def _binary_evaluation_spec(
     services,
     engine,
     run_id,
@@ -92,7 +92,7 @@ def _evaluation_spec(
     return services.EvaluationConfig.model_validate(payload)
 
 
-def run_pipeline(
+def _binary_run_pipeline(
     engine,
     *,
     run_id,
@@ -133,7 +133,7 @@ def run_pipeline(
         raise ValueError("alert-rate policy requires an explicit batch_definition")
     if batch_definition is not None and batch_definition != policy.batch_definition:
         raise ValueError("batch_definition differs from the evaluation policy")
-    if not check_only and not acknowledge_research_release:
+    if not check_only and (not acknowledge_research_release):
         raise ValueError("execution requires --acknowledge-research-release")
     before = s.sha256(source)
     preflight = s.evaluate(engine, evaluation_spec, check_only=True)
@@ -164,7 +164,7 @@ def run_pipeline(
             info["parent_run_id"] != run_id
             or info["calibration_id"] != evaluation_spec.calibration_id
             or info["release_variant"] != evaluation_spec.release_variant
-            or info["policy"] != evaluation_spec.policy.model_dump(mode="json")
+            or (info["policy"] != evaluation_spec.policy.model_dump(mode="json"))
         ):
             raise ValueError("existing release differs from the requested predictor/policy")
         report.update(release_id=manifest["release_id"], release_dir=str(existing))
@@ -183,9 +183,7 @@ def run_pipeline(
     if prep_dir is not None:
         if input_format != "raw":
             raise ValueError("--prep-dir is only used with raw input")
-
         prep_dir = Path(prep_dir).expanduser().resolve()
-
         if prep_dir.exists():
             raise FileExistsError(f"Prepared-input directory already exists: {prep_dir}")
     identity = (
@@ -223,7 +221,7 @@ def run_pipeline(
                 calibration_id=evaluation_spec.calibration_id,
                 intended_use=evaluation_spec.intended_use,
                 acknowledge_research_release=True,
-                parity_atol=(1e-6 if parent.get("model_type") == "nn" else 1e-7),
+                parity_atol=1e-06 if parent.get("model_type") == "nn" else 1e-07,
             )
             s.build_release(engine, request, check_only=True)
             released = s.build_release(engine, request, check_only=False)
@@ -265,7 +263,6 @@ def run_pipeline(
             "source_system": "ml_template.scoring.pipeline",
             "business_batch_id": identity,
         }
-
         s.score(
             engine,
             existing,
@@ -275,7 +272,6 @@ def run_pipeline(
             batch_definition=batch_definition,
             batch_metadata=batch_metadata,
         )
-
         scored = s.score(
             engine,
             existing,
@@ -332,7 +328,9 @@ def main(argv=None):
     evaluation = parser.add_mutually_exclusive_group()
     evaluation.add_argument("--evaluation-id")
     evaluation.add_argument("--evaluation-config", type=Path)
-    parser.add_argument("--primary-metric", choices=["roc_auc", "pr_auc", "brier", "log_loss"])
+    parser.add_argument(
+        "--primary-metric", choices=["roc_auc", "pr_auc", "brier", "log_loss", "rmse", "mae"]
+    )
     parser.add_argument("--no-uncertainty", action="store_true")
     parser.add_argument("--acknowledge-prior-exposure", action="store_true")
     parser.add_argument("--prior-exposure-note", default="")
@@ -342,9 +340,7 @@ def main(argv=None):
     parser.add_argument("--chunk-size", type=int)
     parser.add_argument("--batch-definition")
     parser.add_argument(
-        "--prep-dir",
-        type=Path,
-        help="Exact prepared-input directory; must not already exist",
+        "--prep-dir", type=Path, help="Exact prepared-input directory; must not already exist"
     )
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
@@ -354,7 +350,7 @@ def main(argv=None):
     from ml_template.tracking.pipeline_logging import setup_logging
 
     setup_logging()
-    engine, services = get_engine(), _services()
+    engine, services = (get_engine(), _services())
     spec = _evaluation_spec(
         services,
         engine,
@@ -383,8 +379,96 @@ def main(argv=None):
         services=services,
     )
     print(json.dumps(result, indent=2, allow_nan=False))
-    if args.check and not result["ready"]:
+    if args.check and (not result["ready"]):
         raise SystemExit(2)
+
+
+def _services():
+    s = _binary_services()
+    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
+    from ml_template.scoring.pipeline_regression import get_run_task, verify_existing_evaluation
+    from ml_template.scoring.regression_release_config import RegressionReleaseConfig
+
+    s.get_run_task = get_run_task
+    s.verify_existing_evaluation = verify_existing_evaluation
+    s.RegressionEvaluationConfig = RegressionEvaluationConfig
+    s.RegressionReleaseConfig = RegressionReleaseConfig
+    return s
+
+
+def _evaluation_spec(
+    services,
+    engine,
+    run_id,
+    *,
+    evaluation_id=None,
+    evaluation_config=None,
+    primary_metric=None,
+    acknowledge_prior_exposure=False,
+    prior_exposure_note="",
+    no_uncertainty=False,
+):
+    task = getattr(services, "get_run_task", lambda engine, run: "binary_classification")(
+        engine, run_id
+    )
+    arguments = dict(
+        evaluation_id=evaluation_id,
+        evaluation_config=evaluation_config,
+        primary_metric=primary_metric,
+        acknowledge_prior_exposure=acknowledge_prior_exposure,
+        prior_exposure_note=prior_exposure_note,
+        no_uncertainty=no_uncertainty,
+    )
+    if task == "regression":
+        from ml_template.scoring.pipeline_regression import regression_evaluation_spec
+
+        return regression_evaluation_spec(services, engine, run_id, **arguments)
+    if task != "binary_classification":
+        raise ValueError(f"Unsupported pipeline task: {task!r}")
+    return _binary_evaluation_spec(services, engine, run_id, **arguments)
+
+
+def run_pipeline(
+    engine,
+    *,
+    run_id,
+    input_path,
+    evaluation_spec,
+    expected_evaluation_id=None,
+    release_dir=None,
+    input_format="raw",
+    output_root=None,
+    chunk_size=None,
+    batch_definition=None,
+    check_only=True,
+    prep_dir=None,
+    acknowledge_research_release=False,
+    services=None,
+):
+    s = services or _services()
+    task = getattr(s, "get_run_task", lambda engine, run: "binary_classification")(engine, run_id)
+    arguments = dict(
+        run_id=run_id,
+        input_path=input_path,
+        evaluation_spec=evaluation_spec,
+        expected_evaluation_id=expected_evaluation_id,
+        release_dir=release_dir,
+        input_format=input_format,
+        output_root=output_root,
+        chunk_size=chunk_size,
+        batch_definition=batch_definition,
+        check_only=check_only,
+        prep_dir=prep_dir,
+        acknowledge_research_release=acknowledge_research_release,
+        services=s,
+    )
+    if task == "regression":
+        from ml_template.scoring.pipeline_regression import run_regression_pipeline
+
+        return run_regression_pipeline(engine, **arguments)
+    if task != "binary_classification":
+        raise ValueError(f"Unsupported pipeline task: {task!r}")
+    return _binary_run_pipeline(engine, **arguments)
 
 
 if __name__ == "__main__":

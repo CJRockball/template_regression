@@ -70,9 +70,7 @@ def regression_evidence(engine, request):
                     "evaluation/regression_inputs.py",
                 }
             ) and current_code.get(name) != expected:
-                raise ValueError(
-                    f"Evaluated prediction implementation changed: {name}"
-                )
+                raise ValueError(f"Evaluated prediction implementation changed: {name}")
                 raise ValueError(f"Evaluated prediction implementation changed: {name}")
     return p, directory, spec, summary, provenance
 
