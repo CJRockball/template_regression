@@ -1,7 +1,8 @@
-"""Read-only Final evaluation tab. No callback accesses dataset labels or runs evaluation."""
+"""Read-only saved evaluations. Optional explicit plots read registered prediction artifacts, never source datasets or evaluation code."""
 
 import json
 
+from ml_template.dashboard import regression_multi_views as _r2v
 from ml_template.dashboard.evaluation_data import list_evaluations, load_evaluation
 from ml_template.dashboard.evaluation_figs import evaluation_figures
 
@@ -50,12 +51,13 @@ def layout(engine):
                 id="final-eval-id", options=[], placeholder="Select an evaluation", clearable=True
             ),
             html.Div(id="final-eval-content"),
+            _r2v.evaluation_controls(),
         ],
         style={"padding": "1rem"},
     )
 
 
-def render_selection(engine, evaluation_id):
+def _binary_render_selection(engine, evaluation_id):
     from dash import dcc, html
 
     loaded = load_evaluation(engine, evaluation_id)
@@ -103,6 +105,16 @@ def render_selection(engine, evaluation_id):
     return html.Div(children)
 
 
+def render_selection(engine, evaluation_id):
+    loaded = load_evaluation(engine, evaluation_id)
+    if (
+        loaded.get("state") == "verified"
+        and loaded.get("data", {}).get("summary", {}).get("task") == "regression"
+    ):
+        return _r2v.evaluation_view(engine, evaluation_id)
+    return _binary_render_selection(engine, evaluation_id)
+
+
 def register_callbacks(app, engine):
     from dash import Input, Output, State
 
@@ -121,12 +133,10 @@ def register_callbacks(app, engine):
             }
             for r in records
         ]
-        # Do not automatically reveal a final holdout result on page load.
-        return options, current if any(r["evaluation_id"] == current for r in records) else None
+        return (options, current if any(r["evaluation_id"] == current for r in records) else None)
 
     @app.callback(Output("final-eval-content", "children"), Input("final-eval-id", "value"))
     def select(evaluation_id):
         return render_selection(engine, evaluation_id)
 
-
-# calibrated-policy update v1
+    _r2v.register_evaluation(app, engine)

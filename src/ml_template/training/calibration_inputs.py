@@ -59,6 +59,10 @@ def load_calibration_inputs(engine, parent_run_id: str, *, silver_root=None, spl
     for name in ["config.json", "features.json", "model.ubj", "oof_predictions.parquet"]:
         artifacts.verify_artifact(run_dir, name)
     cfg = RunConfig.model_validate_json((run_dir / "config.json").read_text(encoding="utf-8"))
+    if cfg.task == "regression":
+        raise ValueError(
+            "Regression calibration/evaluation/release is not implemented by this training patch"
+        )
     if config_hash(cfg) != parent["config_hash"]:
         raise ValueError("parent config hash disagrees with registry")
     for name in ["silver_dataset_version_id", "feature_set_id"]:

@@ -10,7 +10,11 @@ import pandas as pd
 from ml_template.scoring.release_artifacts import sha256, write_json
 
 
-def export_frame(predictions, reference, *, key, score, output_column):
+def export_frame(
+    predictions, reference, *, key, score, output_column, task="binary_classification"
+):
+    if task not in {"binary_classification", "regression"}:
+        raise ValueError("Unsupported export task")
     if key == output_column or score == key:
         raise ValueError("key and score/output columns must differ")
     if not predictions.columns.is_unique or not reference.columns.is_unique:
@@ -25,7 +29,13 @@ def export_frame(predictions, reference, *, key, score, output_column):
     if pd.api.types.is_bool_dtype(predictions[score].dtype):
         raise ValueError("boolean flags are not probabilities")
     values = pd.to_numeric(predictions[score], errors="raise").to_numpy(dtype=float)
-    if not np.isfinite(values).all() or ((values < 0) | (values > 1)).any():
+    if not np.isfinite(values).all():
+        raise ValueError(
+            "invalid probabilities"
+            if task == "binary_classification"
+            else "invalid regression predictions"
+        )
+    if task == "binary_classification" and ((values < 0) | (values > 1)).any():
         raise ValueError("invalid probabilities")
     selected = pd.DataFrame({key: predictions[key].to_numpy(), output_column: values})
     result = reference[[key]].merge(selected, on=key, how="left", sort=False, validate="one_to_one")
@@ -36,6 +46,9 @@ def export_frame(predictions, reference, *, key, score, output_column):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--task", choices=["binary_classification", "regression"], default="binary_classification"
+    )
     parser.add_argument("--predictions", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--key", required=True)
@@ -51,13 +64,17 @@ def main(argv=None):
         predictions = pd.read_parquet(args.predictions)
     else:
         predictions = pd.read_csv(args.predictions, dtype={args.key: "string"})
-    # Preserve exact textual keys for joining; do not silently strip leading zeros.
     predictions[args.key] = predictions[args.key].astype("string")
     reference = pd.read_csv(args.reference, dtype={args.key: "string"})
     if reference.columns.tolist() != [args.key, args.output_column]:
         raise ValueError("reference must have exactly the intended two-column header")
     result = export_frame(
-        predictions, reference, key=args.key, score=args.score, output_column=args.output_column
+        predictions,
+        reference,
+        key=args.key,
+        score=args.score,
+        output_column=args.output_column,
+        task=args.task,
     )
     if before != {"predictions": sha256(args.predictions), "reference": sha256(args.reference)}:
         raise ValueError("export inputs changed")
@@ -72,6 +89,8 @@ def main(argv=None):
         "input_sha256": before,
         "output_sha256": sha256(args.output),
     }
+    if args.task == "regression":
+        report.update(task="regression", prediction_kind="continuous")
     write_json(sidecar, report)
     print(json.dumps(report, indent=2))
 

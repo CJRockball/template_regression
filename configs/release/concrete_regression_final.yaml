@@ -1,0 +1,8 @@
+schema_version: 2
+task: regression
+name: concrete_xgb_final_v1
+parent_run_id: run_20261105_010321_921eea
+evaluation_id: eval_20261105_071829_da979f1b
+intended_use: Research inference for concrete compressive strength in MPa
+acknowledge_research_release: true
+parity_atol: 0.0000001

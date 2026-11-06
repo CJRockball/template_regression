@@ -74,12 +74,15 @@ def load_importance(engine: Engine, run_id: str, fold: int = -1) -> pd.DataFrame
 
 def load_labels(engine: Engine, header: dict, silver_root: Path = DATA_SILVER) -> pd.Series | None:
     """Version-checked Silver labels with canonical unique keys; never truncate fractional labels."""
+    from ml_template.dashboard.regression_data import guard_binary_labels
+
+    guard_binary_labels(header)
     split = _query(engine, "SELECT * FROM splits WHERE split_id = :s", s=header["split_id"])
     if split.empty:
         return None
     row = split.iloc[0]
-    key, target = row["key_col"], row["target_col"]
-    if pd.isna(key) or pd.isna(target) or not key or not target:
+    key, target = (row["key_col"], row["target_col"])
+    if pd.isna(key) or pd.isna(target) or (not key) or (not target):
         return None
     silver_id = header["silver_dataset_version_id"]
     if row["silver_dataset_version_id"] != silver_id:

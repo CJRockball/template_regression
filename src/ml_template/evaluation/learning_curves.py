@@ -61,31 +61,53 @@ def learning_curves_for_run(
     return pd.concat(parts, ignore_index=True)
 
 
-def plot_learning_curves(table: pd.DataFrame, path: Path, title: str = "") -> None:
-    """One panel per fold: metric against round for train and val, best round dashed."""
+def _outer_curve_axes(table, show_inner_reference=False):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    if table.empty:
+        raise ValueError("No outer diagnostic curves")
     folds = sorted(int(k) for k in table["fold"].unique())
     metric = str(table["metric"].iloc[0])
     fig, axes = plt.subplots(
-        1, len(folds), figsize=(3.2 * len(folds), 3.2), sharey=True, squeeze=False
+        1, len(folds), figsize=(3.6 * len(folds), 3.5), sharey=True, squeeze=False
     )
     for ax, k in zip(axes[0], folds, strict=True):
         part = table[table["fold"] == k]
         for dataset, group in part.groupby("dataset"):
-            ax.plot(group["round"], group["value"], label=dataset)
-        ax.axvline(int(part["best_round"].iloc[0]), ls="--", color="grey", lw=1)
+            group = group.sort_values("round")
+            label = {"train": "outer_train", "val": "outer_validation"}.get(dataset, dataset)
+            ax.plot(group["round"], group["value"], label=label)
+        if show_inner_reference:
+            ax.axvline(
+                int(part["best_round"].iloc[0]),
+                ls="--",
+                color="grey",
+                lw=1,
+                label="inner-selected round — reference only",
+            )
         ax.set(title=f"fold {k}", xlabel="round")
     axes[0][0].set_ylabel(metric)
     axes[0][-1].legend(fontsize=8)
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    return fig, axes
+
+
+def plot_learning_curves(
+    table: pd.DataFrame, path: Path, title: str = "", *, show_inner_reference: bool = False
+) -> None:
+    """Outer diagnostic refit: never use this plot to select the stopping round."""
+    import matplotlib.pyplot as plt
+
+    fig, _ = _outer_curve_axes(table, show_inner_reference)
+    try:
+        heading = "Outer-fold diagnostic fit — no early stopping"
+        fig.suptitle(heading + (f" — {title}" if title else ""))
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+    finally:
+        plt.close(fig)
 
 
 def main(argv: list[str] | None = None) -> Path:

@@ -74,6 +74,19 @@ def evaluate_spec(
     feature_root=None,
     adapter_loader=None,
 ):
+    if getattr(cfg, "task", None) == "regression":
+        from ml_template.evaluation.regression_evaluate import evaluate_regression_spec
+
+        return evaluate_regression_spec(
+            engine,
+            cfg,
+            check_only=check_only,
+            output_root=output_root,
+            silver_root=silver_root,
+            split_root=split_root,
+            feature_root=feature_root,
+            adapter_loader=adapter_loader,
+        )
     p = prepare_evaluation(
         engine, cfg, silver_root=silver_root, split_root=split_root, feature_root=feature_root
     )
@@ -118,7 +131,7 @@ def evaluate_spec(
             "resolved_spec": cfg.model_dump(mode="json"),
             "holdout_labels_loaded": False,
         }
-    if prior and not cfg.acknowledge_prior_exposure:
+    if prior and (not cfg.acknowledge_prior_exposure):
         raise ValueError("holdout previously exposed; document and acknowledge prior exposure")
     if output_root is None:
         from ml_template.paths import ARTIFACTS
@@ -152,9 +165,9 @@ def evaluate_spec(
         if (
             not inputs.X.index.is_unique
             or inputs.X.index.hasnans
-            or not inputs.y.index.is_unique
+            or (not inputs.y.index.is_unique)
             or inputs.y.index.hasnans
-            or set(inputs.X.index) != set(inputs.y.index)
+            or (set(inputs.X.index) != set(inputs.y.index))
         ):
             raise ValueError("feature/label key mismatch")
         pd.testing.assert_frame_equal(
@@ -326,6 +339,8 @@ def evaluate_holdout(
 
 
 def main(argv=None):
+    from ml_template.evaluation.regression_evaluate import default_spec_for_run
+
     p = argparse.ArgumentParser(description=__doc__)
     source = p.add_mutually_exclusive_group(required=True)
     source.add_argument("--config")
@@ -341,7 +356,7 @@ def main(argv=None):
     cfg = (
         load_evaluation_config(args.config)
         if args.config
-        else EvaluationConfig(parent_run_id=args.run_id)
+        else default_spec_for_run(get_engine(), args.run_id)
     )
     print(
         json.dumps(

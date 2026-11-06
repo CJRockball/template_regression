@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ml_template.paths import DATA_SILVER
@@ -69,6 +70,8 @@ def load_silver(
     key_col: str,
     silver_root: Path = DATA_SILVER,
     verify_hash: bool = True,
+    *,
+    task: str = "binary_classification",
 ) -> SilverData:
     out_dir = Path(silver_root) / dataset_name / silver_dataset_version_id
     manifest_path = out_dir / "manifest.json"
@@ -110,8 +113,22 @@ def load_silver(
     if df[key_col].isna().any() or df[key_col].duplicated().any():
         raise ValueError(f"{key_col} must be unique and non-null")
     target = roles["target"][0]
-    if not df[target].isin([0, 1]).all():
-        raise ValueError(f"target {target!r} must be binary 0/1")
+    values = df[target]
+
+    if task == "binary_classification":
+        if not values.isin([0, 1]).all():
+            raise ValueError(f"target {target!r} must be binary 0/1")
+
+    elif task == "regression":
+        if not pd.api.types.is_numeric_dtype(values) or pd.api.types.is_bool_dtype(values):
+            raise ValueError(f"target {target!r} must be numeric")
+
+        numeric = values.to_numpy(dtype=float, na_value=np.nan)
+        if not np.isfinite(numeric).all():
+            raise ValueError(f"target {target!r} must be finite with no nulls")
+
+    else:
+        raise ValueError(f"unsupported task: {task!r}")
 
     return SilverData(
         silver_dataset_version_id=silver_dataset_version_id,

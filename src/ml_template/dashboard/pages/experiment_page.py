@@ -9,6 +9,8 @@ from dash import Dash, Input, Output, dcc, html
 from sqlalchemy import Engine
 
 from ml_template.dashboard import experiment_data as ed
+from ml_template.dashboard import regression_multi_data as _r2
+from ml_template.dashboard import regression_multi_views as _r2v
 
 PREFIX = "experiments-"
 
@@ -40,8 +42,7 @@ def seed_figure(rows: pd.DataFrame, ranking: pd.DataFrame) -> go.Figure:
                 jitter=0.25,
                 pointpos=0,
                 customdata=part[["seed", "run_id"]].to_numpy(),
-                hovertemplate="score %{y:.5f}<br>seed %{customdata[0]}"
-                "<br>%{customdata[1]}<extra>%{fullData.name}</extra>",
+                hovertemplate="score %{y:.5f}<br>seed %{customdata[0]}<br>%{customdata[1]}<extra>%{fullData.name}</extra>",
             )
         )
     if ranking.empty:
@@ -57,7 +58,7 @@ def seed_figure(rows: pd.DataFrame, ranking: pd.DataFrame) -> go.Figure:
 
 
 def layout(engine: Engine) -> html.Div:
-    runs = ed.load_experiment_runs(engine)
+    runs = _r2.binary_runs(engine)
     cohorts = ed.cohort_options(runs)
     names = sorted(runs["experiment_name"].unique())
     latest = None
@@ -67,69 +68,68 @@ def layout(engine: Engine) -> html.Div:
             if not ed.select_cohort(runs.loc[[newest.name]], option["value"]).empty:
                 latest = option["value"]
                 break
-    return html.Div(
-        [
-            html.H2("Named experiments"),
-            html.P(
-                "Refresh the browser with F5 after training. All scores below are development/CV scores."
-            ),
-            html.H3("Inventory — all datasets and statuses"),
-            _grid(ed.experiment_inventory(runs), 250),
-            html.H3("Seed-sweep leaderboard"),
-            html.Label("Comparison cohort: Silver version | stored split | primary metric"),
-            dcc.Dropdown(
-                id=PREFIX + "cohort",
-                options=cohorts,
-                value=latest or (cohorts[0]["value"] if cohorts else None),
-                clearable=False,
-            ),
-            html.Label(
-                "Named experiments (empty = all; table shows every recipe, chart shows top 10)"
-            ),
-            dcc.Dropdown(id=PREFIX + "names", options=names, value=[], multi=True),
-            dcc.RadioItems(
-                id=PREFIX + "direction",
-                options=[
-                    {"label": "Higher score is better", "value": "higher"},
-                    {"label": "Lower score is better", "value": "lower"},
-                ],
-                value="higher",
-                inline=True,
-            ),
-            html.P(id=PREFIX + "note"),
-            html.Div(id=PREFIX + "leaderboard"),
-            dcc.Graph(id=PREFIX + "seeds"),
-            html.H3("Runs for the selected experiments and cohort"),
-            html.P(
-                "Includes running and failed runs. Use the run ID on the Single run tab to inspect a completed run."
-            ),
-            html.Div(id=PREFIX + "runs"),
-            html.P(
-                "Spread is sample standard deviation across model seeds, not independent-data uncertainty. "
-                "Unknown code changes in dirty working trees cannot be verified from these records."
-            ),
-        ],
-        style={
-            "maxWidth": "1400px",
-            "margin": "0 auto",
-            "padding": "16px",
-            "fontFamily": "sans-serif",
-        },
+    return _r2v.wrap(
+        html.Div(
+            [
+                html.H2("Named experiments"),
+                html.P(
+                    "Refresh the browser with F5 after training. All scores below are development/CV scores."
+                ),
+                html.H3("Inventory — all datasets and statuses"),
+                _grid(ed.experiment_inventory(runs), 250),
+                html.H3("Seed-sweep leaderboard"),
+                html.Label("Comparison cohort: Silver version | stored split | primary metric"),
+                dcc.Dropdown(
+                    id=PREFIX + "cohort",
+                    options=cohorts,
+                    value=latest or (cohorts[0]["value"] if cohorts else None),
+                    clearable=False,
+                ),
+                html.Label(
+                    "Named experiments (empty = all; table shows every recipe, chart shows top 10)"
+                ),
+                dcc.Dropdown(id=PREFIX + "names", options=names, value=[], multi=True),
+                dcc.RadioItems(
+                    id=PREFIX + "direction",
+                    options=[
+                        {"label": "Higher score is better", "value": "higher"},
+                        {"label": "Lower score is better", "value": "lower"},
+                    ],
+                    value="higher",
+                    inline=True,
+                ),
+                html.P(id=PREFIX + "note"),
+                html.Div(id=PREFIX + "leaderboard"),
+                dcc.Graph(id=PREFIX + "seeds"),
+                html.H3("Runs for the selected experiments and cohort"),
+                html.P(
+                    "Includes running and failed runs. Use the run ID on the Single run tab to inspect a completed run."
+                ),
+                html.Div(id=PREFIX + "runs"),
+                html.P(
+                    "Spread is sample standard deviation across model seeds, not independent-data uncertainty. Unknown code changes in dirty working trees cannot be verified from these records."
+                ),
+            ],
+            style={
+                "maxWidth": "1400px",
+                "margin": "0 auto",
+                "padding": "16px",
+                "fontFamily": "sans-serif",
+            },
+        ),
+        engine,
+        "experiments",
     )
 
 
 def build_view(engine: Engine, cohort: str | None, names: list[str] | None, direction: str):
-    runs = ed.select_cohort(ed.load_experiment_runs(engine), cohort)
+    runs = ed.select_cohort(_r2.binary_runs(engine), cohort)
     if names:
         runs = runs[runs["experiment_name"].isin(names)]
     board = ed.seed_leaderboard(runs, higher_is_better=direction != "lower")
     selected = ed.seed_rows(runs)
     omitted = int(selected["seed"].isna().sum())
-    note = (
-        f"{len(board)} experiment/recipe groups. Ranking uses one latest successful run "
-        f"per recorded model seed; std is blank for one seed. {omitted} unseeded runs "
-        "excluded from ranking. Different model settings remain separate rows."
-    )
+    note = f"{len(board)} experiment/recipe groups. Ranking uses one latest successful run per recorded model seed; std is blank for one seed. {omitted} unseeded runs excluded from ranking. Different model settings remain separate rows."
     cols = [
         "experiment_name",
         "experiment_run_id",
@@ -151,10 +151,11 @@ def build_view(engine: Engine, cohort: str | None, names: list[str] | None, dire
         .dt.strftime("%Y-%m-%d %H:%M:%S")
     )
     detail = detail.rename(columns={"started_at": "started_sgt"})
-    return _grid(board), seed_figure(selected, board.head(10)), _grid(detail, 400), note
+    return (_grid(board), seed_figure(selected, board.head(10)), _grid(detail, 400), note)
 
 
 def register_callbacks(app: Dash, engine: Engine) -> None:
+
     @app.callback(
         Output(PREFIX + "leaderboard", "children"),
         Output(PREFIX + "seeds", "figure"),
@@ -166,3 +167,5 @@ def register_callbacks(app: Dash, engine: Engine) -> None:
     )
     def _view(cohort, names, direction):
         return build_view(engine, cohort, names, direction)
+
+    _r2v.register_ranking(app, engine, "experiments")

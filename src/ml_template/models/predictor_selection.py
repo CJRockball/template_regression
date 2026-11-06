@@ -45,7 +45,7 @@ def safe_file(root, name):
     return path
 
 
-def required_predictor_files(descriptor):
+def _legacy_required_predictor_files(descriptor):
     """Validate descriptor structure before any model/transformer deserialisation."""
     if descriptor.get("schema_version") != 1 or descriptor.get("kind") not in {"final", "cv_mean"}:
         raise ValueError("unsupported predictor descriptor")
@@ -56,12 +56,12 @@ def required_predictor_files(descriptor):
     members = descriptor.get("members")
     if not isinstance(members, list) or not members:
         raise ValueError("predictor members are missing")
-    kind, fitted = descriptor["kind"], descriptor["fitted_features"]
+    kind, fitted = (descriptor["kind"], descriptor["fitted_features"])
     if kind == "final" and len(members) != 1:
         raise ValueError("final predictor requires one member")
     if kind == "cv_mean" and len(members) < 2:
         raise ValueError("CV mean requires at least two members")
-    expected, folds = set(), []
+    expected, folds = (set(), [])
     for member in members:
         if set(member) != {"fold_id", "model_path", "transformer_path", "weight"}:
             raise ValueError("invalid predictor member fields")
@@ -82,7 +82,7 @@ def required_predictor_files(descriptor):
         if (
             isinstance(weight, bool)
             or not isinstance(weight, (float, int))
-            or not np.isfinite(weight)
+            or (not np.isfinite(weight))
         ):
             raise ValueError("invalid member weight")
         if not np.isclose(weight, 1.0 / len(members), atol=1e-15, rtol=0):
@@ -98,7 +98,7 @@ def required_predictor_files(descriptor):
     if not isinstance(hashes, dict) or set(hashes) != expected:
         raise ValueError("predictor artifact hash coverage differs from members")
     if any(
-        not isinstance(h, str) or re.fullmatch(r"[0-9a-f]{64}", h) is None for h in hashes.values()
+        not isinstance(h, str) or re.fullmatch("[0-9a-f]{64}", h) is None for h in hashes.values()
     ):
         raise ValueError("invalid predictor artifact hash")
     return sorted(expected)
@@ -115,7 +115,7 @@ def verify_predictor_files(root, descriptor, *, names=None):
             raise ValueError(f"predictor artifact missing or changed: {name}")
 
 
-def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None):
+def _legacy_describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None):
     """Bind selected predictor artifacts to the ORIGINAL training artifact manifest."""
     if kind not in {"final", "cv_mean"}:
         raise ValueError("unknown predictor kind")
@@ -123,7 +123,7 @@ def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_arti
         from ml_template.tracking.run_artifacts import verify_artifact
     root = Path(run_dir)
     fitted = bool(cfg.fitted_features)
-    names, members = [], []
+    names, members = ([], [])
     if kind == "cv_mean":
         if fold_ids is None:
             raise ValueError("CV mean requires fold IDs from the verified stored split")
@@ -173,7 +173,7 @@ def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_arti
     return descriptor
 
 
-def _validate_against_config(cfg, descriptor):
+def _legacy_validate_against_config(cfg, descriptor):
     required_predictor_files(descriptor)
     if bool(cfg.fitted_features) != descriptor["fitted_features"]:
         raise ValueError("saved predictor fitted-feature identity differs from config")
@@ -189,6 +189,8 @@ class FoldMeanPredictor:
     """
 
     def __init__(self, cfg, root, descriptor, *, adapter_loader=None):
+        if getattr(cfg, "task", "binary_classification") == "regression":
+            raise ValueError("Use RegressionFoldMeanPredictor for regression")
         import copy
 
         self.cfg = cfg
@@ -225,13 +227,12 @@ class FoldMeanPredictor:
         return total / len(self.descriptor["members"])
 
 
-def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):
+def _legacy_load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):
     if adapter_loader is None:
         from ml_template.models.model_factory import load_adapter
 
         adapter_loader = load_adapter
     if descriptor is None:
-        # Legacy sealed final-model release; caller already verifies its manifest/runtime.
         return adapter_loader(cfg, Path(root) / "model.ubj")
     _validate_against_config(cfg, descriptor)
     verify_predictor_files(root, descriptor)
@@ -248,3 +249,38 @@ def load_evaluation_predictor(prepared, *, adapter_loader=None):
     return load_selected_predictor(
         prepared.run_cfg, prepared.run_dir, descriptor, adapter_loader=adapter_loader
     )
+
+
+def required_predictor_files(descriptor):
+    if descriptor.get("schema_version") == 2:
+        from ml_template.models.regression_predictor import validate_descriptor
+
+        return validate_descriptor(descriptor, _legacy_required_predictor_files)
+    if descriptor.get("task") == "regression":
+        raise ValueError("Regression requires a version-2 predictor descriptor")
+    return _legacy_required_predictor_files(descriptor)
+
+
+def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None):
+    if getattr(cfg, "task", "binary_classification") == "regression":
+        from ml_template.models.regression_predictor import describe
+
+        return describe(cfg, run_dir, kind, fold_ids=fold_ids, verify_artifact=verify_artifact)
+    return _legacy_describe_predictor(
+        cfg, run_dir, kind, fold_ids=fold_ids, verify_artifact=verify_artifact
+    )
+
+
+def _validate_against_config(cfg, descriptor):
+    regression = getattr(cfg, "task", "binary_classification") == "regression"
+    if regression != (descriptor.get("schema_version") == 2):
+        raise ValueError("Predictor task/schema disagrees with run configuration")
+    return _legacy_validate_against_config(cfg, descriptor)
+
+
+def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):
+    if getattr(cfg, "task", "binary_classification") == "regression":
+        from ml_template.models.regression_predictor import load
+
+        return load(cfg, root, descriptor, adapter_loader=adapter_loader)
+    return _legacy_load_selected_predictor(cfg, root, descriptor, adapter_loader=adapter_loader)

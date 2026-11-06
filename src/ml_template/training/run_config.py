@@ -53,7 +53,7 @@ class DataConfig(_Strict):
 class SplitConfig(_Strict):
     """Holdout policy and development-only CV-fold policy."""
 
-    method: Literal["stratified"] = "stratified"
+    method: Literal["stratified", "random"] = "stratified"
     holdout_fraction: float = Field(0.2, gt=0, lt=1)
     n_folds: int = Field(5, ge=2)
 
@@ -103,7 +103,7 @@ class AnalysisConfig(_Strict):
     permutation_max_rows: int = Field(50_000, ge=100)  # validation rows used per fold
     error_sample_size: int = Field(25, ge=0)  # rows per kind in error_sample.csv; 0 = off
     learning_curves: bool = False  # per-round train/validation metric table; off by default
-    learning_curve_metric: Literal["logloss", "aucpr", "auc", "error"] = "logloss"
+    learning_curve_metric: Literal["logloss", "aucpr", "auc", "error", "rmse", "mae"] = "logloss"
     learning_curve_rounds: int | None = Field(None, ge=1)  # None = twice each fold's best round
 
 
@@ -125,9 +125,39 @@ class XGBParams(_Strict):
     device: Literal["cpu", "cuda"] = "cpu"
 
 
+class XGBRegressionParams(_Strict):
+    objective: Literal["reg:squarederror"] = "reg:squarederror"
+    eval_metric: Literal["rmse", "mae"] = "rmse"
+    n_estimators: int = Field(2000, ge=1)
+    early_stopping_rounds: int = Field(50, ge=1)
+    max_depth: int = Field(4, ge=1)
+    learning_rate: float = Field(0.05, gt=0)
+    subsample: float = Field(0.8, gt=0, le=1)
+    colsample_bytree: float = Field(0.8, gt=0, le=1)
+    min_child_weight: float = Field(1.0, ge=0)
+    reg_lambda: float = Field(1.0, ge=0)
+    reg_alpha: float = Field(0.0, ge=0)
+    max_bin: int = Field(256, ge=2)
+    device: Literal["cpu", "cuda"] = "cpu"
+
+
+class RegressionMetricsConfig(_Strict):
+    primary: Literal["rmse", "mae", "r2"] = "rmse"
+    names: list[str] = Field(default_factory=lambda: ["rmse", "mae", "r2"])
+    alert_rates: list[float] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_regression(self):
+        if set(self.names) - {"rmse", "mae", "r2"} or self.alert_rates:
+            raise ValueError("Regression supports rmse/mae/r2 and no alert rates")
+        if self.primary not in self.names:
+            raise ValueError("Primary regression metric must be in names")
+        return self
+
+
 class XGBModelConfig(_Strict):
     type: Literal["xgb"] = "xgb"
-    params: XGBParams = Field(default_factory=XGBParams)
+    params: XGBParams | XGBRegressionParams = Field(default_factory=XGBParams)
 
 
 class LGBMParams(_Strict):
@@ -181,17 +211,73 @@ ModelConfig = Annotated[
 
 class RunConfig(_Strict):
     schema_version: Literal[2] = SCHEMA_VERSION
+    task: Literal["binary_classification", "regression"] = "binary_classification"
     experiment_name: str
     seed: int = 42  # model seed; the split has its own
     data: DataConfig
     split: SplitConfig = Field(default_factory=SplitConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
-    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    metrics: MetricsConfig | RegressionMetricsConfig = Field(default_factory=MetricsConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     # Steps that learn from training rows (group statistics, power transforms); None = none.
     fitted_features: list[dict[str, Any]] | None = None
     # Add further model types to ``ModelConfig`` (a union keyed on ``type``).
     model: ModelConfig = Field(default_factory=XGBModelConfig)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _regression_defaults(cls, data):
+        if isinstance(data, dict) and data.get("task") == "regression":
+            data = copy.deepcopy(data)
+            data["metrics"] = RegressionMetricsConfig.model_validate(data.get("metrics", {}))
+            raw_model = data.get("model", {})
+            raw_params = (
+                raw_model.get("params", {}) if isinstance(raw_model, dict) else raw_model.params
+            )
+            monitor = (
+                raw_params.get("eval_metric", "rmse")
+                if isinstance(raw_params, dict)
+                else raw_params.eval_metric
+            )
+            analysis = {
+                "permutation_importance": False,
+                "error_sample_size": 0,
+                "learning_curves": False,
+                "learning_curve_metric": monitor,
+            }
+            given = data.get("analysis", {})
+            if not isinstance(given, dict):
+                given = given.model_dump()
+            analysis.update(given)
+            data["analysis"] = analysis
+            if "split" not in data:
+                data["split"] = {"method": "random"}
+        return data
+
+    @model_validator(mode="after")
+    def _task_compatibility(self):
+        regression = self.task == "regression"
+        if regression:
+            if self.model.type != "xgb" or not isinstance(self.model.params, XGBRegressionParams):
+                raise ValueError("Regression currently requires xgb with reg:squarederror")
+            if self.split.method != "random":
+                raise ValueError("Regression requires split.method: random")
+            if not isinstance(self.metrics, RegressionMetricsConfig):
+                raise ValueError("Regression requires regression metrics")
+            if self.metrics.primary == "r2":
+                raise ValueError("Use rmse or mae as the initial primary metric; r2 is diagnostic")
+            if self.fitted_features:
+                raise ValueError("Regression fitted_features are not supported in this first patch")
+            if self.analysis.permutation_importance or self.analysis.error_sample_size:
+                raise ValueError("Regression analyses are not implemented; disable them")
+        else:
+            if isinstance(self.metrics, RegressionMetricsConfig):
+                raise ValueError("Binary tasks require classification metrics")
+            if self.model.type == "xgb" and isinstance(self.model.params, XGBRegressionParams):
+                raise ValueError("Regression objective requires task: regression")
+            if self.split.method != "stratified":
+                raise ValueError("Binary task requires stratified splits")
+        return self
 
     @field_validator("experiment_name")
     @classmethod
@@ -208,6 +294,18 @@ class RunConfig(_Strict):
 
             validate_specs(v)
         return v
+
+    @model_validator(mode="after")
+    def _curve_metric_compatibility(self):
+        if self.analysis.learning_curves:
+            allowed = (
+                {"rmse", "mae"}
+                if self.task == "regression"
+                else {"logloss", "aucpr", "auc", "error"}
+            )
+            if self.analysis.learning_curve_metric not in allowed:
+                raise ValueError(f"Learning-curve metric incompatible with task {self.task!r}")
+        return self
 
 
 # --- raw YAML handling -------------------------------------------------------
@@ -323,6 +421,8 @@ def config_json(cfg: RunConfig) -> str:
 def config_hash(cfg: RunConfig) -> str:
     """Identity of what the run trains. Reporting-only sections and unset options are left out."""
     payload = cfg.model_dump(mode="json", exclude=HASH_EXCLUDED_SECTIONS)
+    if payload.get("task") == "binary_classification":
+        payload.pop("task", None)
     if payload.get("fitted_features") is None:
         payload.pop("fitted_features", None)
     if payload["split"].get("cv_seed") is None:

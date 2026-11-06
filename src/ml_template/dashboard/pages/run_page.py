@@ -14,9 +14,11 @@ import pandas as pd
 from dash import Dash, Input, Output, dcc, html
 from sqlalchemy import Engine
 
+from ml_template.dashboard import regression_data as _reg_data
 from ml_template.dashboard import run_data as rd
 from ml_template.dashboard import run_figs as rf
 from ml_template.dashboard import threshold_panels
+from ml_template.dashboard.pages import regression_run_page as _reg_page
 
 ALL = "(all)"
 SECTION = {"marginTop": "32px"}
@@ -42,11 +44,12 @@ def _grid(df: pd.DataFrame, height: int = 280) -> dag.AgGrid:
 
 @lru_cache(maxsize=8)
 def _scored(engine: Engine, run_id: str) -> pd.DataFrame | None:
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return None
     try:
         header = rd.run_header(engine, run_id)
         return rd.load_oof_with_labels(engine, header, rd.run_dir(header))
     except (ValueError, KeyError, OSError):
-        # Threshold panel gives a visible reason; existing score plots show placeholders.
         return None
 
 
@@ -70,6 +73,8 @@ def holdout_label(evaluated_at) -> str:
 
 
 def header_view(engine: Engine, run_id: str | None) -> html.Div:
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return _reg_page.header_view(engine, run_id)
     if not run_id:
         return html.Div("No runs found. Train one with `make train`.")
     h = rd.run_header(engine, run_id)
@@ -91,11 +96,13 @@ def header_view(engine: Engine, run_id: str | None) -> html.Div:
 
 def metrics_view(engine: Engine, run_id: str | None):
     """Metric dropdown options, default metric, and a summary table component."""
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return ([], None, html.P("Regression metrics are shown below"))
     if not run_id:
-        return [], None, html.Div("No run selected")
+        return ([], None, html.Div("No run selected"))
     m = rd.load_metrics(engine, run_id)
     if m.empty:
-        return [], None, html.Div("No metrics stored for this run")
+        return ([], None, html.Div("No metrics stored for this run"))
     cv = m[m["split"] == "cv"]
     table = pd.DataFrame({"pooled": cv[cv["fold"] == -1].set_index("metric")["value"]})
     per_fold = cv[cv["fold"] >= 0].groupby("metric")["value"].agg(["mean", "std"])
@@ -107,24 +114,33 @@ def metrics_view(engine: Engine, run_id: str | None):
     table = table.reset_index(names="metric")
     metrics = sorted(table["metric"])
     primary = rd.run_header(engine, run_id)["primary_metric"]
-    return metrics, (primary if primary in metrics else metrics[0]), _grid(table)
+    return (metrics, primary if primary in metrics else metrics[0], _grid(table))
 
 
 def curves_view(engine: Engine, run_id: str | None, overlay: bool):
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return (
+            rf.empty_fig("Use the regression panel"),
+            rf.empty_fig("Inner and outer fits are separate"),
+        )
     table = None
     if run_id:
         table = rd.load_learning_curves(rd.run_dir(rd.run_header(engine, run_id)))
-    return rf.learning_curve_fig(table, overlay), rf.gap_fig(table)
+    return (rf.learning_curve_fig(table, overlay), rf.gap_fig(table))
 
 
 def importance_methods(engine: Engine, run_id: str | None) -> tuple[list[str], str | None]:
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return ([], None)
     if not run_id:
-        return [], None
+        return ([], None)
     methods = sorted(rd.load_importance(engine, run_id)["method"].unique())
-    return methods, (methods[0] if methods else None)
+    return (methods, methods[0] if methods else None)
 
 
 def importance_view(engine: Engine, run_id: str | None, method: str | None):
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return rf.empty_fig("Select a saved regression analysis below")
     imp = rd.load_importance(engine, run_id) if run_id else None
     return rf.importance_fig(imp, method)
 
@@ -153,6 +169,8 @@ def threshold_view(engine: Engine, run_id: str | None, threshold: float):
 
 
 def errors_view(engine: Engine, run_id: str | None):
+    if run_id and _reg_data.is_regression_run(engine, run_id):
+        return html.P("Saved regression error examples are shown below")
     if not run_id:
         return html.Div("No run selected")
     sample = rd.load_error_sample(rd.run_dir(rd.run_header(engine, run_id)))
@@ -183,87 +201,92 @@ def layout(engine: Engine) -> html.Div:
     runs = rd.list_runs(engine)
     experiments = [ALL, *sorted(runs["experiment_name"].unique())]
     options, default = run_choices(engine, ALL)
-    return html.Div(
-        [
-            html.H2("Single run"),
-            html.Div(
-                [
-                    html.Div(
-                        [
-                            html.Label("Experiment"),
-                            dcc.Dropdown(experiments, ALL, id="experiment-dd", clearable=False),
-                        ],
-                        style={"width": "280px"},
-                    ),
-                    html.Div(
-                        [
-                            html.Label("Run (latest first)"),
-                            dcc.Dropdown(options, default, id="run-dd", clearable=False),
-                        ],
-                        style={"width": "520px"},
-                    ),
-                ],
-                style={"display": "flex", "gap": "16px"},
-            ),
-            html.Div(id="run-header", style={"marginTop": "12px"}),
-            html.H3("Metrics", style=SECTION),
-            html.Div(id="metrics-table"),
-            dcc.Dropdown(
-                id="metric-dd", clearable=False, style={"width": "260px", "marginTop": "8px"}
-            ),
-            dcc.Graph(id="fold-fig"),
-            html.H3("Learning curve", style=SECTION),
-            dcc.RadioItems(
-                [
-                    {"label": "Panel per fold", "value": "panels"},
-                    {"label": "Overlay folds", "value": "overlay"},
-                ],
-                "panels",
-                id="lc-mode",
-                inline=True,
-            ),
-            dcc.Graph(id="lc-fig"),
-            dcc.Graph(id="gap-fig"),
-            html.H3("Feature importance", style=SECTION),
-            dcc.Dropdown(id="imp-method", clearable=False, style={"width": "260px"}),
-            dcc.Graph(id="imp-fig"),
-            html.H3("Predictions and cutoff", style=SECTION),
-            html.Div(
-                [
-                    dcc.Graph(id="pr-fig", style={"flex": 1}),
-                    dcc.Graph(id="rel-fig", style={"flex": 1}),
-                ],
-                style={"display": "flex"},
-            ),
-            dcc.Slider(
-                0,
-                1,
-                0.01,
-                value=0.5,
-                id="thr-slider",
-                marks={0: "0", 0.5: "0.5", 1: "1"},
-                tooltip={"placement": "bottom"},
-            ),
-            html.Div(id="thr-text", style={"marginTop": "8px"}),
-            dcc.Graph(id="hist-fig"),
-            html.H3("Estimated OOF thresholds", style=SECTION),
-            html.Div(id="run-threshold-analysis"),
-            html.H3("Errors (out-of-fold)", style=SECTION),
-            html.Div(id="errors-table"),
-            html.H3("Cost", style=SECTION),
-            html.Div(id="cost-text"),
-            dcc.Graph(id="cost-fig"),
-        ],
-        style={
-            "maxWidth": "1200px",
-            "margin": "0 auto",
-            "padding": "16px",
-            "fontFamily": "sans-serif",
-        },
+    return _reg_page.wrap_layout(
+        html.Div(
+            [
+                html.H2("Single run"),
+                html.Div(
+                    [
+                        html.Div(
+                            [
+                                html.Label("Experiment"),
+                                dcc.Dropdown(experiments, ALL, id="experiment-dd", clearable=False),
+                            ],
+                            style={"width": "280px"},
+                        ),
+                        html.Div(
+                            [
+                                html.Label("Run (latest first)"),
+                                dcc.Dropdown(options, default, id="run-dd", clearable=False),
+                            ],
+                            style={"width": "520px"},
+                        ),
+                    ],
+                    style={"display": "flex", "gap": "16px"},
+                ),
+                html.Div(id="run-header", style={"marginTop": "12px"}),
+                html.H3("Metrics", style=SECTION),
+                html.Div(id="metrics-table"),
+                dcc.Dropdown(
+                    id="metric-dd", clearable=False, style={"width": "260px", "marginTop": "8px"}
+                ),
+                dcc.Graph(id="fold-fig"),
+                html.H3("Learning curve", style=SECTION),
+                dcc.RadioItems(
+                    [
+                        {"label": "Panel per fold", "value": "panels"},
+                        {"label": "Overlay folds", "value": "overlay"},
+                    ],
+                    "panels",
+                    id="lc-mode",
+                    inline=True,
+                ),
+                dcc.Graph(id="lc-fig"),
+                dcc.Graph(id="gap-fig"),
+                html.H3("Feature importance", style=SECTION),
+                dcc.Dropdown(id="imp-method", clearable=False, style={"width": "260px"}),
+                dcc.Graph(id="imp-fig"),
+                html.H3("Predictions and cutoff", style=SECTION),
+                html.Div(
+                    [
+                        dcc.Graph(id="pr-fig", style={"flex": 1}),
+                        dcc.Graph(id="rel-fig", style={"flex": 1}),
+                    ],
+                    style={"display": "flex"},
+                ),
+                dcc.Slider(
+                    0,
+                    1,
+                    0.01,
+                    value=0.5,
+                    id="thr-slider",
+                    marks={0: "0", 0.5: "0.5", 1: "1"},
+                    tooltip={"placement": "bottom"},
+                ),
+                html.Div(id="thr-text", style={"marginTop": "8px"}),
+                dcc.Graph(id="hist-fig"),
+                html.H3("Estimated OOF thresholds", style=SECTION),
+                html.Div(id="run-threshold-analysis"),
+                html.H3("Errors (out-of-fold)", style=SECTION),
+                html.Div(id="errors-table"),
+                html.H3("Cost", style=SECTION),
+                html.Div(id="cost-text"),
+                dcc.Graph(id="cost-fig"),
+            ],
+            style={
+                "maxWidth": "1200px",
+                "margin": "0 auto",
+                "padding": "16px",
+                "fontFamily": "sans-serif",
+            },
+        ),
+        engine,
+        default,
     )
 
 
 def register_callbacks(app: Dash, engine: Engine) -> None:
+
     @app.callback(
         Output("run-dd", "options"), Output("run-dd", "value"), Input("experiment-dd", "value")
     )
@@ -341,4 +364,8 @@ def register_callbacks(app: Dash, engine: Engine) -> None:
         Input("thr-slider", "value"),
     )
     def _threshold_estimates(run_id, threshold):
+        if run_id and _reg_data.is_regression_run(engine, run_id):
+            return html.P("Classification thresholds do not apply to regression")
         return threshold_panels.render_single(engine, run_id, threshold)
+
+    _reg_page.register_callbacks(app, engine)

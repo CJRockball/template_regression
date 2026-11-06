@@ -137,7 +137,12 @@ class EvaluationConfig(StrictModel):
 
 
 def load_evaluation_config(path):
-    return EvaluationConfig.model_validate(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and raw.get("task") == "regression":
+        from ml_template.evaluation.regression_config import RegressionEvaluationConfig
+
+        return RegressionEvaluationConfig.model_validate(raw)
+    return EvaluationConfig.model_validate(raw)
 
 
 # calibrated-policy update v1

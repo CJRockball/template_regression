@@ -116,4 +116,18 @@ def test_dash_page_when_installed(saved):
     app = Dash(__name__)
     app.layout = evaluation_page.layout(c)
     evaluation_page.register_callbacks(app, c)
-    assert len(app.callback_map) == 2
+    assert len(app.callback_map) == 3
+    required_outputs = {
+        ("final-eval-id", "options"),
+        ("final-eval-id", "value"),
+        ("final-eval-content", "children"),
+        ("reg2-eval-controls", "style"),
+        ("reg2-eval-predictions", "children"),
+    }
+    registered_outputs = set()
+    for metadata in app.callback_map.values():
+        values = metadata["output"]
+        values = values if isinstance(values, (list, tuple)) else [values]
+        for output in values:
+            registered_outputs.add((output.component_id, output.component_property))
+    assert required_outputs <= registered_outputs
