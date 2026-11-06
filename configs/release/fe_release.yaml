@@ -1,0 +1,8 @@
+schema_version: 2
+task: regression
+name: stateless_regression_research
+parent_run_id: REPLACE_WITH_FE_TRAINING_RUN_ID
+evaluation_id: REPLACE_WITH_SUCCESSFUL_FE_EVALUATION_ID
+intended_use: Research inference with verified stateless feature replay
+acknowledge_research_release: true
+parity_atol: 0.0000001

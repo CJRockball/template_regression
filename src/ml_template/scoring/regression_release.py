@@ -58,31 +58,24 @@ def regression_evidence(engine, request):
     ):
         raise ValueError("Evaluated predictor/data artifacts changed")
     current_code = runtime_info()["code_sha256"]
-    for name, expected in provenance["code_hashes"].items():
-        current_code = runtime_info()["code_sha256"]
+    from ml_template.features.prepared_recipe import verify_prediction_code
 
-        for name, expected in provenance["code_hashes"].items():
-            if (
-                name.startswith(("models/", "features/", "preprocessing/"))
-                or name
-                in {
-                    "training/run_config.py",
-                    "evaluation/regression_inputs.py",
-                }
-            ) and current_code.get(name) != expected:
-                raise ValueError(f"Evaluated prediction implementation changed: {name}")
-                raise ValueError(f"Evaluated prediction implementation changed: {name}")
-    return p, directory, spec, summary, provenance
+    verify_prediction_code(provenance["code_hashes"], current_code)
+    return (p, directory, spec, summary, provenance)
 
 
 def prepare_regression_release(engine, request):
-    from ml_template.scoring.input_contract import validate_batch
+    from ml_template.features.feature_set_store import resolve_feature_set
+    from ml_template.features.prepared_recipe import prepare_frame, verify_prepared
+    from ml_template.scoring.input_contract import coerce_frame, validate_batch
     from ml_template.scoring.pre_gold_schema import build_pre_gold_contract
     from ml_template.scoring.source_spec import freeze_source_spec
 
     p, directory, spec, summary, provenance = regression_evidence(engine, request)
-    # Project only the key and model-neutral feature columns. Never request y_true/target.
-    source = pd.read_parquet(p.parquet_path, columns=[p.key_col, *p.feature_names])
+    plan = provenance["feature_preparation"]
+    raw_columns = plan["recipe"]["raw_columns"]
+    # Features only: never request target or y_true for packaging or parity.
+    source = pd.read_parquet(p.parquet_path, columns=[p.key_col, *raw_columns])
     if (
         source[p.key_col].isna().any()
         or source[p.key_col].duplicated().any()
@@ -90,19 +83,20 @@ def prepare_regression_release(engine, request):
     ):
         raise ValueError("Source key coverage differs")
     source = source.set_index(p.key_col).sort_index()
-    model_features = source.copy()
-    categories = p.feature_info.get("categorical_schema", {})
-    for name, item in categories.items():
-        model_features[name] = model_features[name].astype(
-            pd.CategoricalDtype(item["categories"], ordered=item["ordered"])
+    model_features = prepare_frame(source, plan["recipe"], plan["model_schema"])
+    cached = source
+    if p.run_cfg.data.feature_set_id:
+        cached = resolve_feature_set(
+            p.run_cfg.data.feature_set_id,
+            source,
+            p.run_cfg.data.silver_dataset_version_id,
+            p.roots["feature_root"],
         )
-    if list(model_features.columns) != p.feature_names:
-        raise ValueError("Feature order differs")
-    for name, dtype in p.feature_info["dtypes"].items():
-        if str(model_features[name].dtype) != dtype:
-            raise ValueError(f"Source dtype differs from training: {name}")
+    cached = coerce_frame(cached, plan["model_schema"])
+    pd.testing.assert_frame_equal(cached, model_features)
     if sha256(p.parquet_path) != provenance["input_hashes"]["silver_parquet"]:
-        raise ValueError("Silver changed while reading source features")
+        raise ValueError("Silver changed while projecting raw features")
+    verify_prepared(p)
     input_spec, source_policy, model_policy = freeze_source_spec(p, source)
     keys = source.index.to_series()
     is_int = keys.map(
@@ -110,7 +104,7 @@ def prepare_regression_release(engine, request):
     ).all()
     is_str = keys.map(lambda v: isinstance(v, str)).all()
     if not is_int and not is_str:
-        raise ValueError("Entity keys must be homogeneous int or string")
+        raise ValueError("Entity keys must be homogeneous integer or string")
     contract = build_pre_gold_contract(
         source,
         model_features,
@@ -121,12 +115,6 @@ def prepare_regression_release(engine, request):
         model_policy=model_policy,
     )
     validate_batch(source.reset_index(), contract, enforce_rates=True)
-    recipe = {
-        "schema_version": 1,
-        "kind": "identity",
-        "raw_columns": p.feature_names,
-        "columns": p.feature_names,
-    }
     return {
         "prepared": p,
         "evaluation_dir": directory,
@@ -135,7 +123,7 @@ def prepare_regression_release(engine, request):
         "provenance": provenance,
         "source": source,
         "contract": contract,
-        "recipe": recipe,
+        "recipe": plan["recipe"],
         "reference_sha256": read_json(directory / "artifact_manifest.json")["files"][
             "holdout_predictions.parquet"
         ]["sha256"],
@@ -192,7 +180,7 @@ def check_regression_parity(predictor, material, atol):
 
 def build_regression_release(engine, request, *, check_only=False, output_root=None):
     material = prepare_regression_release(engine, request)
-    p, spec = material["prepared"], material["spec"]
+    p, spec = (material["prepared"], material["spec"])
     if check_only:
         return {
             "ready": True,
@@ -252,17 +240,16 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
                 "evaluation_summary": material["summary"],
             },
         )
-        for name in ["config.json", *descriptor["files_sha256"]]:
+        for name in ["config.json", "features.json", *descriptor["files_sha256"]]:
             dest = inside(stage, name)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p.run_dir / name, dest)
-            expected = (
-                material["provenance"]["input_hashes"]["config"]
-                if name == "config.json"
-                else descriptor["files_sha256"][name]
-            )
+            if name in {"config.json", "features.json"}:
+                expected = material["provenance"]["input_hashes"][name.removesuffix(".json")]
+            else:
+                expected = descriptor["files_sha256"][name]
             if sha256(dest) != expected:
-                raise ValueError(f"Copied predictor artifact changed: {name}")
+                raise ValueError("Copied predictor artifact changed: " + name)
         seal(stage)
         parity = check_regression_parity(ReleasedPredictor(stage), material, request.parity_atol)
         write_json(stage / "parity.json", parity)
