@@ -79,7 +79,7 @@ def layout():
         [
             html.H3("Regression — saved development artifacts"),
             html.P(
-                "Read-only. No model deserialisation, fitting, analysis execution or raw-label reads. Regression Compare/Sweeps/Final evaluation views are outside this patch."
+                "Read-only saved development artifacts. Regression comparison/ranking use separate task selectors; Final evaluation displays frozen evidence. No fitting or new evaluation."
             ),
             html.Button("Refresh saved analyses", id=P + "refresh", n_clicks=0),
             html.Label("Choose a saved analysis explicitly; no automatic latest selection"),
