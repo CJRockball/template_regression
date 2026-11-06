@@ -105,20 +105,28 @@ def test_reader_does_not_touch_prediction_artifact(saved, monkeypatch):
 
 
 def test_dash_page_when_installed(saved):
-    pytest.importorskip('dash')
+    pytest.importorskip("dash")
     from dash import Dash
+
     from ml_template.dashboard.pages import evaluation_page
+
     c, _, _ = saved
     assert evaluation_page.layout(c) is not None
-    assert evaluation_page.render_selection(c, 'e') is not None
+    assert evaluation_page.render_selection(c, "e") is not None
     app = Dash(__name__)
     app.layout = evaluation_page.layout(c)
     evaluation_page.register_callbacks(app, c)
     assert len(app.callback_map) == 3
-    required_outputs = {('final-eval-id', 'options'), ('final-eval-id', 'value'), ('final-eval-content', 'children'), ('reg2-eval-controls', 'style'), ('reg2-eval-predictions', 'children')}
+    required_outputs = {
+        ("final-eval-id", "options"),
+        ("final-eval-id", "value"),
+        ("final-eval-content", "children"),
+        ("reg2-eval-controls", "style"),
+        ("reg2-eval-predictions", "children"),
+    }
     registered_outputs = set()
     for metadata in app.callback_map.values():
-        values = metadata['output']
+        values = metadata["output"]
         values = values if isinstance(values, (list, tuple)) else [values]
         for output in values:
             registered_outputs.add((output.component_id, output.component_property))

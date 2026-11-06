@@ -62,11 +62,11 @@ def main(argv: list[str] | None = None) -> str:
     contract = load_dataset_contract(resolve_path(cfg.data.dataset_config))
     silver_id = args.silver_version_id or cfg.data.silver_dataset_version_id
     silver = load_silver(
-    silver_id,
-    cfg.data.dataset_name,
-    contract.entity_id,
-    args.silver_root,
-    task=cfg.task,
+        silver_id,
+        cfg.data.dataset_name,
+        contract.entity_id,
+        args.silver_root,
+        task=cfg.task,
     )
     raw = silver.model_frame()[silver.features]
 

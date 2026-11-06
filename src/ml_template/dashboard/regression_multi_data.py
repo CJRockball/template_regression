@@ -91,8 +91,22 @@ def nonbinary_frame(frame):
             if not (values.notna() & np.isfinite(values)).any():
                 return False
         raise ValueError("Cannot establish task/metric for scored summary rows")
-    binary = {"auc", "aucpr", "roc_auc", "pr_auc", "brier", "log_loss", "logloss",
-              "binary_logloss", "error", "accuracy", "precision", "recall", "f1", "f2"}
+    binary = {
+        "auc",
+        "aucpr",
+        "roc_auc",
+        "pr_auc",
+        "brier",
+        "log_loss",
+        "logloss",
+        "binary_logloss",
+        "error",
+        "accuracy",
+        "precision",
+        "recall",
+        "f1",
+        "f2",
+    }
     metric = next(iter(metrics))
     if metric in binary or metric.startswith(("precision_at_", "recall_at_")) or explicit_binary:
         return False
@@ -110,8 +124,12 @@ def nonbinary_launch(engine, launch, *, frame=None):
             raise ValueError("Supply a validated summary frame or a real registry engine")
         # nonbinary_frame already validated the injected frame; no unchecked bypass.
         return False
-    return any(base.task_hint(row) != "binary_classification" for row in base.rows(
-        engine, "SELECT * FROM model_runs WHERE experiment_run_id=?", (launch,)))
+    return any(
+        base.task_hint(row) != "binary_classification"
+        for row in base.rows(
+            engine, "SELECT * FROM model_runs WHERE experiment_run_id=?", (launch,)
+        )
+    )
 
 
 def _unit(value):
