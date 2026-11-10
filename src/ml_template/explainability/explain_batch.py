@@ -71,6 +71,10 @@ def authoring_runtime():
 
 
 def preflight(config):
+    if getattr(config, "task", "binary_classification") == "regression":
+        from ml_template.explainability.regression_batch import explain_batch as explain_regression
+
+        return explain_regression(config, check_only=True)
     saved = load_saved_batch(config)
     check_scoring_record(config, saved)
     with tempfile.TemporaryDirectory(prefix="ml-explain-check-") as temporary:
@@ -266,6 +270,10 @@ def write_outputs(stage, config, saved, response, result, reproduced, explanatio
 
 
 def explain_batch(config, *, check_only=False):
+    if getattr(config, "task", "binary_classification") == "regression":
+        from ml_template.explainability.regression_batch import explain_batch as explain_regression
+
+        return explain_regression(config, check_only=check_only)
     if check_only:
         return preflight(config)
     # Read-only validation precedes all execution registration and model loading.

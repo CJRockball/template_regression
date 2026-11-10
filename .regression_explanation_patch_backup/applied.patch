@@ -1,0 +1,1067 @@
+--- a/src/ml_template/explainability/explanation_config.py
++++ b/src/ml_template/explainability/explanation_config.py
+@@ -2,6 +2,7 @@
+ 
+ import os
+ from pathlib import Path
++from typing import Literal
+ 
+ import yaml
+ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+@@ -10,6 +11,10 @@
+ class ExplanationConfig(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+     schema_version: StrictInt = 1
++    task: Literal["binary_classification", "regression"] = "binary_classification"
++    target_unit: StrictStr | None = None
++    prediction_atol: float = Field(default=1e-5, ge=0, allow_inf_nan=False)
++    prediction_rtol: float = Field(default=1e-5, ge=0, allow_inf_nan=False)
+     release_dir: StrictStr
+     scoring_dir: StrictStr
+     expected_release_id: StrictStr
+--- a/src/ml_template/explainability/explain_batch.py
++++ b/src/ml_template/explainability/explain_batch.py
+@@ -71,6 +71,10 @@
+ 
+ 
+ def preflight(config):
++    if getattr(config, "task", "binary_classification") == "regression":
++        from ml_template.explainability.regression_batch import explain_batch as explain_regression
++
++        return explain_regression(config, check_only=True)
+     saved = load_saved_batch(config)
+     check_scoring_record(config, saved)
+     with tempfile.TemporaryDirectory(prefix="ml-explain-check-") as temporary:
+@@ -266,6 +270,10 @@
+ 
+ 
+ def explain_batch(config, *, check_only=False):
++    if getattr(config, "task", "binary_classification") == "regression":
++        from ml_template.explainability.regression_batch import explain_batch as explain_regression
++
++        return explain_regression(config, check_only=check_only)
+     if check_only:
+         return preflight(config)
+     # Read-only validation precedes all execution registration and model loading.
+--- a/src/ml_template/explainability/presentation_data.py
++++ b/src/ml_template/explainability/presentation_data.py
+@@ -80,6 +80,10 @@
+     for name in ("explanation_id", "release_id", "scoring_batch_id", "n_rows", "n_features"):
+         if summary.get(name) != record.get(name):
+             raise ValueError(f"registry/summary mismatch: {name}")
++    if summary.get("task") == "regression":
++        from ml_template.explainability.regression_presentation import load_view
++
++        return load_view(record, summary, manifest, directory, max_rows=max_rows)
+     if summary.get("schema_version") != 1 or summary.get("artifact_state") != "complete":
+         raise ValueError("unsupported/incomplete explanation summary")
+     if (
+--- a/src/ml_template/explainability/figures.py
++++ b/src/ml_template/explainability/figures.py
+@@ -7,6 +7,10 @@
+ import plotly.graph_objects as go
+ 
+ from ml_template.explainability.presentation_data import selected_entity
++
++
++def output_unit(view):
++    return escape(view.summary["target_unit"]) if getattr(view, "summary", {}).get("task") == "regression" else "log-odds"
+ 
+ 
+ def placeholder(message):
+@@ -40,13 +44,17 @@
+     figure.update_layout(
+         template="plotly_white",
+         title=f"Global importance — all {len(view.rows)} scoring rows",
+-        xaxis_title="Mean absolute contribution (log-odds)",
++        xaxis_title=f"Mean absolute contribution ({output_unit(view)})",
+         height=max(400, 30 * len(table)),
+     )
+     return figure
+ 
+ 
+ def distribution_figure(view, *, top_n=10, max_points=2000):
++    if getattr(view, "summary", {}).get("task") == "regression":
++        from ml_template.explainability.regression_figures import distribution_figure as regression_distribution
++
++        return regression_distribution(view, top_n=top_n, max_points=max_points)
+     positions = sample_positions(view, max_points)
+     figure = go.Figure()
+     for name in view.importance.head(top_n).feature:
+@@ -70,6 +78,8 @@
+ 
+ 
+ def dependence_figure(view, feature, *, max_points=2000):
++    if feature in getattr(view, "summary", {}).get("varying_feature_values", []):
++        return placeholder("Dependence unavailable: this estimator input differs across fold transforms")
+     if feature not in view.features:
+         raise ValueError("feature not found in saved estimator inputs")
+     positions = sample_positions(view, max_points)
+@@ -77,7 +87,7 @@
+     numeric = pd.api.types.is_numeric_dtype(values.dtype) and not pd.api.types.is_bool_dtype(
+         values.dtype
+     )
+-    x = values.to_numpy() if numeric else [escape(str(v)) for v in values]
++    x = values.to_numpy(dtype=float, na_value=np.nan) if numeric else [escape(str(v)) for v in values]
+     keys = [escape(str(k)) for k in view.rows.index[positions]]
+     figure = go.Figure(
+         go.Scattergl(
+@@ -86,10 +96,10 @@
+             mode="markers",
+             text=keys,
+             marker={
+-                "color": view.rows.p_release.iloc[positions],
++                "color": view.rows["y_pred_release" if getattr(view, "summary", {}).get("task") == "regression" else "p_release"].iloc[positions],
+                 "colorscale": "Viridis",
+                 "showscale": True,
+-                "colorbar": {"title": "Release<br>probability"},
++                "colorbar": {"title": "Release prediction" if getattr(view, "summary", {}).get("task") == "regression" else "Release<br>probability"},
+                 "size": 6,
+                 "opacity": 0.7,
+             },
+@@ -101,7 +111,7 @@
+         template="plotly_white",
+         title=f"{escape(str(feature))} — {len(positions)} sampled rows",
+         xaxis_title=escape(str(feature)),
+-        yaxis_title="Contribution (log-odds)",
++        yaxis_title=f"Contribution ({output_unit(view)})",
+         height=450,
+     )
+     return figure
+@@ -121,7 +131,7 @@
+         go.Waterfall(
+             orientation="h",
+             measure=["absolute", *(["relative"] * len(values)), "total"],
+-            y=["Baseline", *names, "Prediction margin"],
++            y=["Baseline", *names, "Prediction" if getattr(view, "summary", {}).get("task") == "regression" else "Prediction margin"],
+             x=[float(row.base_value), *values, 0],
+             connector={"line": {"color": "gray"}},
+             increasing={"marker": {"color": "#c44240"}},
+@@ -130,8 +140,8 @@
+     )
+     figure.update_layout(
+         template="plotly_white",
+-        title=f"Entity {escape(str(key))}: base-model explanation",
+-        xaxis_title="Base-model log-odds — not probability percentage points",
++        title=f"Entity {escape(str(key))}: " + ("released predictor explanation" if getattr(view, "summary", {}).get("task") == "regression" else "base-model explanation"),
++        xaxis_title=f"Prediction ({output_unit(view)})" if getattr(view, "summary", {}).get("task") == "regression" else "Base-model log-odds — not probability percentage points",
+         height=max(450, 33 * (len(values) + 2)),
+         yaxis={"autorange": "reversed"},
+     )
+--- a/src/ml_template/usage_dashboard/app.py
++++ b/src/ml_template/usage_dashboard/app.py
+@@ -29,7 +29,7 @@
+     table = view.rows[
+         [
+             name
+-            for name in ("p_raw", "p_calibrated", "p_release", "policy_flag")
++            for name in ("p_raw", "p_calibrated", "p_release", "policy_flag", "y_pred_raw", "y_pred_release")
+             if name in view.rows
+         ]
+     ].copy()
+@@ -53,7 +53,7 @@
+     key, row, table = selected_entity(view, position)
+     scores = {
+         name: str(row[name])
+-        for name in ("p_raw", "p_calibrated", "p_release", "policy_flag")
++        for name in ("p_raw", "p_calibrated", "p_release", "policy_flag", "y_pred_raw", "y_pred_release")
+         if name in row.index
+     }
+     return (
+@@ -105,7 +105,7 @@
+                 ),
+                 html.Pre(id="usage-summary"),
+                 html.P(
+-                    "Contributions explain base-model log-odds, not calibrated probabilities or causes. All global figures describe the complete scoring batch. The entity table can be filtered without changing global figures or the original policy."
++                    "Classification contributions explain base-model log-odds, not calibrated probabilities. Regression contributions explain continuous predictions in the declared target units. Neither establishes causes. Global figures describe the complete scoring batch. CV inputs that vary across fitted transforms are explicitly marked; their dependence plots are disabled."
+                 ),
+                 dcc.Graph(id="usage-importance"),
+                 dcc.Graph(id="usage-distribution"),
+--- /dev/null
++++ b/src/ml_template/explainability/regression_result.py
+@@ -0,0 +1,78 @@
++"""Validated keyed continuous Tree SHAP in estimator-input space, not log-odds."""
++from dataclasses import dataclass
++from numbers import Real
++import numpy as np
++import pandas as pd
++
++
++@dataclass(frozen=True)
++class RegressionTolerance:
++    prediction_atol: float = 1e-5
++    prediction_rtol: float = 1e-5
++
++    def __post_init__(self):
++        for value in vars(self).values():
++            if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value) or value < 0:
++                raise ValueError("finite nonnegative explanation tolerances required")
++
++
++@dataclass(frozen=True)
++class RegressionExplanation:
++    features: pd.DataFrame
++    contributions: pd.DataFrame
++    rows: pd.DataFrame
++    verification: dict
++    method: str = "xgboost_native_tree_shap"
++    output_scale: str = "prediction_target_units"
++    feature_dependence: str = "tree_path_dependent"
++
++
++def build_regression_explanation(features, contributions, base_values, predictions, *, tolerance=None):
++    tol = RegressionTolerance() if tolerance is None else tolerance
++    if not isinstance(tol, RegressionTolerance):
++        raise TypeError("RegressionTolerance required")
++    if (not isinstance(features, pd.DataFrame) or features.empty
++            or not features.columns.is_unique or isinstance(features.index, pd.MultiIndex)
++            or features.index.hasnans or not features.index.is_unique
++            or not all(isinstance(c, str) and c for c in features.columns)):
++        raise ValueError("nonempty uniquely keyed features and unique names required")
++    if isinstance(contributions, pd.DataFrame) and (
++            not contributions.index.equals(features.index)
++            or not contributions.columns.equals(features.columns)):
++        raise ValueError("contribution labels differ from features")
++    for value in (base_values, predictions):
++        if isinstance(value, pd.Series) and not value.index.equals(features.index):
++            raise ValueError("prediction/baseline labels differ from features")
++    values = np.asarray(contributions)
++    base, predicted = np.asarray(base_values), np.asarray(predictions)
++    n, width = features.shape
++    if (values.shape != (n, width) or base.shape != (n,) or predicted.shape != (n,)
++            or any(v.dtype.kind not in "iuf" for v in (values, base, predicted))):
++        raise ValueError("real numeric row-by-feature contributions and row vectors required")
++    values, base, predicted = (v.astype(float) for v in (values, base, predicted))
++    if not all(np.isfinite(v).all() for v in (values, base, predicted)):
++        raise ValueError("nonfinite regression explanation")
++    reconstructed = base + values.sum(axis=1)
++    if not np.allclose(reconstructed, predicted, atol=tol.prediction_atol, rtol=tol.prediction_rtol):
++        raise ValueError("contributions do not reconstruct regression predictions")
++    rows = pd.DataFrame({"base_value": base, "y_pred_raw": predicted,
++                         "y_pred_reconstructed": reconstructed,
++                         "additivity_residual": reconstructed - predicted}, index=features.index.copy())
++    return RegressionExplanation(
++        features.copy(deep=True),
++        pd.DataFrame(values.copy(), index=features.index.copy(), columns=features.columns.copy()),
++        rows, {"passed": True, "n_rows": n, "n_features": width,
++               "max_abs_additivity_residual": float(np.max(abs(reconstructed-predicted))),
++               "tolerance": vars(tol).copy(), "labels_loaded": False},
++    )
++
++
++def global_summary(result):
++    values = result.contributions
++    return pd.DataFrame({
++        "feature": values.columns,
++        "mean_abs_contribution": values.abs().mean().to_numpy(),
++        "mean_contribution": values.mean().to_numpy(),
++        "positive_fraction": values.gt(0).mean().to_numpy(),
++        "n_rows": len(values), "output_scale": result.output_scale,
++    }).sort_values(["mean_abs_contribution", "feature"], ascending=[False, True]).reset_index(drop=True)
+--- /dev/null
++++ b/src/ml_template/explainability/regression_worker.py
+@@ -0,0 +1,182 @@
++"""Standalone -I worker; imports only the selected PINNED ml_template at execution.
++
++This script is copied outside the pinned source tree. It requires no new methods
++in old adapters and never edits models, manifests, source, registries or labels.
++"""
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++
++def fingerprint(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
++                                     allow_nan=False).encode()).hexdigest()
++
++
++def native_contributions(adapter, features):
++    import numpy as np
++    import xgboost as xgb
++
++    transformer = getattr(adapter, "transformer", None)
++    expanded = transformer.transform(features) if transformer is not None else features.copy()
++    inner = getattr(adapter, "inner", adapter)
++    booster = inner._booster()
++    if json.loads(booster.save_config())["learner"]["objective"]["name"] != "reg:squarederror":
++        raise ValueError("only identity-link reg:squarederror is supported")
++    if list(expanded.columns) != booster.feature_names or not expanded.index.equals(features.index):
++        raise ValueError("expanded estimator schema or entity alignment differs")
++    best = booster.attr("best_iteration")
++    rounds = (0, int(best) + 1) if best is not None else (0, 0)
++    matrix = xgb.DMatrix(expanded, enable_categorical=True)
++    native = np.asarray(booster.predict(matrix, pred_contribs=True, approx_contribs=False,
++                                       strict_shape=True, iteration_range=rounds))
++    if native.shape != (len(expanded), 1, len(expanded.columns)+1) or not np.isfinite(native).all():
++        raise ValueError("unexpected native continuous contribution shape/values")
++    return expanded, native[:, 0, :-1].astype(float), native[:, 0, -1].astype(float)
++
++
++def run(request, output, *, check_only):
++    import numpy as np
++    import pandas as pd
++    import ml_template
++    from ml_template.scoring.release_artifacts import (
++        verify, verify_runtime, runtime_info, read_json, sha256, file_entries,
++    )
++    source_root = Path(ml_template.__file__).resolve().parent
++    if source_root != Path(request["runtime_source_root"]).resolve():
++        raise ValueError("selected Python imports a different pinned source root")
++    if Path(__file__).resolve().is_relative_to(source_root):
++        raise ValueError("standalone worker must remain outside pinned source")
++    binding = request["binding"]
++    release, score = Path(request["release_dir"]), Path(request["scoring_dir"])
++    runtime = read_json(release / "runtime.json")
++    def reverify():
++        manifest = verify(release, binding["release_id"])
++        verify_runtime(runtime)
++        if manifest["content_sha256"] != binding["release_content_sha256"]:
++            raise ValueError("release changed")
++        if (score / "artifacts.json").is_symlink():
++            raise ValueError("scoring manifest symlink unsupported")
++        if (sha256(score / "artifacts.json") != binding["scoring_manifest_sha256"]
++                or file_entries(score, exclude=("artifacts.json",)) != binding["scoring_files"]):
++            raise ValueError("scoring artifacts changed")
++    reverify()
++    info, summary = read_json(release / "release.json"), read_json(score / "summary.json")
++    if (info.get("task") != "regression" or info.get("release_variant") != "raw"
++            or info.get("calibration_id") is not None or info["policy"]["kind"] != "none"
++            or summary.get("task") != "regression" or summary.get("schema_version") != 2
++            or summary["release_id"] != binding["release_id"]
++            or summary["scoring_batch_id"] != binding["scoring_batch_id"]):
++        raise ValueError("unsupported or mismatched continuous batch/release")
++    contract = read_json(release / "contract.json")
++    key = contract["key_col"]
++    from ml_template.scoring.input_contract import validate_batch
++    snapshot = score / binding["snapshot_name"]
++    frame = (pd.read_csv(snapshot, dtype={key: "string"} if contract["key_kind"] == "str" else None)
++             if snapshot.suffix == ".csv" else pd.read_parquet(snapshot))
++    raw = validate_batch(frame, contract)
++    saved = pd.read_parquet(score / "predictions.parquet")
++    required = {key, "y_pred_raw", "y_pred_release", "release_id", "scoring_batch_id"}
++    if (saved.columns.duplicated().any() or set(saved) != required
++            or saved[key].isna().any() or saved[key].duplicated().any()
++            or set(saved[key]) != set(raw.index) or len(saved) != len(raw)
++            or len(raw) != summary["n_rows"] or not 0 < len(raw) <= request["max_rows"]):
++        raise ValueError("invalid saved regression prediction coverage/schema")
++    saved = saved.set_index(key).loc[raw.index]
++    for name in ("release_id", "scoring_batch_id"):
++        if not saved[name].eq(binding[name]).all():
++            raise ValueError("saved prediction identity differs")
++    for name in ("y_pred_raw", "y_pred_release"):
++        values = saved[name]
++        if (not pd.api.types.is_numeric_dtype(values.dtype)
++                or pd.api.types.is_bool_dtype(values.dtype)
++                or not np.isfinite(values.to_numpy(float)).all()):
++            raise ValueError("saved continuous predictions must be finite numeric")
++    response = {"schema_version": 2, "ready": True, "task": "regression",
++                "release_id": binding["release_id"], "scoring_batch_id": binding["scoring_batch_id"],
++                "binding_sha256": binding["binding_sha256"], "runtime_source_root": str(source_root),
++                "runtime_sha256": fingerprint(runtime), "worker_sha256": sha256(Path(__file__)),
++                "labels_loaded": False, "model_deserialized": False, "predictions_computed": False,
++                "n_rows": len(raw)}
++    if check_only:
++        reverify()
++        return response
++    from ml_template.scoring.predictor import ReleasedPredictor
++    from ml_template.models.model_factory import load_adapter
++    from ml_template.models.predictor_selection import safe_file, verify_predictor_files
++    from ml_template.training.run_config import RunConfig
++    cfg = RunConfig.model_validate(read_json(release / "config.json"))
++    descriptor = read_json(release / "predictor.json")
++    predictor = ReleasedPredictor(release, expected_release_id=binding["release_id"])
++    reproduced = predictor.predict(frame, chunk_size=request["chunk_size"]).set_index(key).loc[raw.index]
++    tolerance = request["tolerance"]
++    atol, rtol = tolerance["prediction_atol"], tolerance["prediction_rtol"]
++    for name in ("y_pred_raw", "y_pred_release"):
++        if not np.allclose(saved[name], reproduced[name], atol=atol, rtol=rtol):
++            raise ValueError("saved continuous prediction parity failed: " + name)
++    feature_parts, phi_parts, base_parts, varying = [], [], [], set()
++    names = None
++    for start in range(0, len(raw), request["chunk_size"]):
++        selected = predictor.prepare_features(frame.iloc[start:start+request["chunk_size"]])
++        first, total, baseline = None, None, None
++        for member in descriptor["members"]:
++            verify_predictor_files(release, descriptor)
++            adapter = load_adapter(cfg, safe_file(release, member["model_path"]))
++            expanded, phi, base = native_contributions(adapter, selected)
++            if names is None:
++                names = list(expanded.columns)
++            if list(expanded.columns) != names:
++                raise ValueError("member estimator feature names differ")
++            if first is None:
++                first = expanded.copy()
++                total, baseline = np.zeros_like(phi), np.zeros_like(base)
++            else:
++                for name in names:
++                    if not first[name].equals(expanded[name]):
++                        varying.add(name)
++            total += phi * member["weight"]
++            baseline += base * member["weight"]
++            del adapter
++        feature_parts.append(first)
++        phi_parts.append(total)
++        base_parts.append(baseline)
++    features = pd.concat(feature_parts)
++    for name in varying:
++        features[name] = "varies across fold transforms"
++    phi, bases = np.concatenate(phi_parts), np.concatenate(base_parts)
++    predicted = reproduced.y_pred_raw.to_numpy(float)
++    if not np.allclose(bases + phi.sum(axis=1), predicted, atol=atol, rtol=rtol):
++        raise ValueError("weighted contributions do not reconstruct released predictor")
++    reverify()
++    features.to_parquet(output / "features.parquet", index=True)
++    np.savez_compressed(output / "contributions.npz", contributions=phi,
++                        base_values=bases, predictions=predicted)
++    reproduced.to_parquet(output / "reproduced_predictions.parquet", index=True)
++    import xgboost as xgb
++    response.update(model_deserialized=True, predictions_computed=True,
++                    method="xgboost_native_tree_shap", output_scale="prediction_target_units",
++                    feature_dependence="tree_path_dependent", n_features=len(names), feature_names=names,
++                    varying_feature_values=sorted(varying), predictor_kind=descriptor["kind"],
++                    aggregation="saved_member_weights_sum_signed_contributions_and_baselines",
++                    xgboost_version=xgb.__version__,
++                    files=file_entries(output, exclude=("request.json", "response.json")))
++    return response
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--request", type=Path, required=True)
++    parser.add_argument("--output", type=Path, required=True)
++    parser.add_argument("--check", action="store_true")
++    args = parser.parse_args()
++    try:
++        response = run(json.loads(args.request.read_text()), args.output, check_only=args.check)
++    except Exception as exc:
++        (args.output / "response.json").write_text(json.dumps({"ready": False, "error": str(exc)}))
++        raise
++    (args.output / "response.json").write_text(json.dumps(response, allow_nan=False))
++
++
++if __name__ == "__main__":
++    main()
+--- /dev/null
++++ b/src/ml_template/explainability/regression_bridge.py
+@@ -0,0 +1,63 @@
++"""Run an external, hashed regression worker in the exact selected release runtime."""
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++from ml_template.explainability.artifacts import read_json, sha256, verify_files, write_json
++
++
++def run_worker(config, binding, directory, *, check_only):
++    executable = Path(config.runtime_python)
++    source = Path(config.runtime_source_root).resolve()
++    if not executable.is_file() or not os.access(executable, os.X_OK):
++        raise ValueError("explicit executable runtime_python required")
++    if not (source / "__init__.py").is_file():
++        raise ValueError("explicit pinned ml_template source root required")
++    directory = Path(directory).resolve()
++    request = {name: getattr(config, name) for name in
++               ("release_dir", "scoring_dir", "runtime_source_root", "chunk_size", "max_rows")}
++    request.update(binding=binding, tolerance={"prediction_atol": config.prediction_atol,
++                                               "prediction_rtol": config.prediction_rtol})
++    write_json(directory / "request.json", request)
++    origin = Path(__file__).with_name("regression_worker.py")
++    worker_hash = sha256(origin)
++    environment = os.environ.copy()
++    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"):
++        environment.pop(name, None)
++    # Copy the standalone script, NOT package code, outside the inference source.
++    with tempfile.TemporaryDirectory(prefix="regression-shap-script-") as temp:
++        worker = Path(temp) / "worker.py"
++        shutil.copyfile(origin, worker)
++        if worker.is_relative_to(source) or sha256(worker) != worker_hash:
++            raise ValueError("standalone worker placement/hash invalid")
++        command = [str(executable), "-I", str(worker), "--request",
++                   str(directory / "request.json"), "--output", str(directory)]
++        if check_only:
++            command.append("--check")
++        completed = subprocess.run(command, cwd=directory, env=environment, capture_output=True,
++                                   text=True, timeout=config.timeout_seconds, check=False)
++    path = directory / "response.json"
++    response = read_json(path) if path.is_file() else {}
++    if completed.returncode or response.get("ready") is not True:
++        raise ValueError("pinned regression explanation failed: " +
++                         str(response.get("error") or completed.stderr[-3000:]))
++    if sha256(origin) != worker_hash or response.get("worker_sha256") != worker_hash:
++        raise ValueError("explanation worker implementation changed")
++    for name in ("release_id", "scoring_batch_id", "binding_sha256"):
++        if response.get(name) != binding[name]:
++            raise ValueError("worker identity differs: " + name)
++    if (Path(response["runtime_source_root"]).resolve() != source
++            or response.get("labels_loaded") is not False or response.get("task") != "regression"):
++        raise ValueError("worker runtime/task/label evidence differs")
++    if check_only:
++        if response.get("model_deserialized") is not False or response.get("predictions_computed") is not False:
++            raise ValueError("check unexpectedly executed a model")
++    else:
++        if response.get("model_deserialized") is not True or response.get("predictions_computed") is not True:
++            raise ValueError("missing inference evidence")
++        expected = {"features.parquet", "contributions.npz", "reproduced_predictions.parquet"}
++        if set(response.get("files", {})) != expected:
++            raise ValueError("worker output inventory differs")
++        verify_files(directory, response["files"], exclude=("request.json", "response.json"))
++    return response
+--- /dev/null
++++ b/src/ml_template/explainability/regression_batch.py
+@@ -0,0 +1,169 @@
++"""Versioned regression explanations of complete registered scoring batches."""
++import html
++import sqlite3
++import tempfile
++import time
++import uuid
++from contextlib import closing
++from datetime import UTC, datetime
++from pathlib import Path
++import numpy as np
++import pandas as pd
++from ml_template.explainability.artifacts import (
++    file_entries, fingerprint, read_json, seal_explanation, sha256, verify_explanation, write_json,
++)
++from ml_template.explainability.regression_bridge import run_worker
++from ml_template.explainability.regression_result import (
++    RegressionTolerance, build_regression_explanation, global_summary,
++)
++
++
++def inspect(config):
++    from ml_template.monitoring.monitor_inputs import load_batch
++    from ml_template.scoring.release_artifacts import verify as verify_release
++    database = Path(config.registry_path).resolve()
++    if not database.is_file():
++        raise ValueError("existing project database required")
++    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as conn:
++        batch = load_batch(conn, config.expected_scoring_batch_id)
++        found = conn.execute("SELECT artifact_dir FROM model_releases WHERE release_id=?",
++                             (config.expected_release_id,)).fetchone()
++    if (batch.task != "regression" or batch.release_id != config.expected_release_id
++            or not found or Path(found[0]).resolve() != Path(config.release_dir).resolve()
++            or Path(batch.record["artifact_dir"]).resolve() != Path(config.scoring_dir).resolve()
++            or len(batch.source) > config.max_rows):
++        raise ValueError("explicit registered batch/release paths, task or row limit differ")
++    if not config.target_unit or not config.target_unit.strip():
++        raise ValueError("explicit regression target_unit required")
++    release = verify_release(config.release_dir, config.expected_release_id)
++    score = Path(config.scoring_dir)
++    entries = file_entries(score, exclude=("artifacts.json",))
++    snapshots = [name for name in entries if name in {"input.csv", "input.parquet"}]
++    if len(snapshots) != 1:
++        raise ValueError("one canonical source snapshot required")
++    binding = {"release_id": batch.release_id, "scoring_batch_id": batch.batch_id,
++               "release_content_sha256": release["content_sha256"],
++               "scoring_manifest_sha256": sha256(score / "artifacts.json"),
++               "scoring_files": entries, "snapshot_name": snapshots[0]}
++    binding["binding_sha256"] = fingerprint(binding)
++    return batch, binding
++
++
++def explain_batch(config, *, check_only=False):
++    from ml_template.explainability.explain_batch import authoring_runtime, validate_groups
++    batch, binding = inspect(config)
++    before = authoring_runtime()
++    started = time.perf_counter()
++    if check_only:
++        with tempfile.TemporaryDirectory(prefix="regression-explain-check-") as temporary:
++            response = run_worker(config, binding, temporary, check_only=True)
++        return {"ready": True, "task": "regression", "n_rows": len(batch.source),
++                "runtime_sha256": response["runtime_sha256"], "labels_loaded": False,
++                "predictions_computed": False, "registry_written": False,
++                "project_artifacts_written": False, "transient_ipc_files_used": True}
++    from ml_template.db import explanation_registry as registry
++    root = Path(config.output_root)
++    root.mkdir(parents=True, exist_ok=True)
++    identity = f"explain_{datetime.now(UTC):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:12]}"
++    destination = root / identity
++    stage = Path(tempfile.mkdtemp(prefix=".regression-explanation-", dir=root))
++    registered, published = False, False
++    try:
++        registry.start(config.registry_path, identity, config.model_dump(), binding, destination)
++        registered = True
++        with tempfile.TemporaryDirectory(prefix="regression-explain-worker-") as temporary:
++            temporary = Path(temporary)
++            response = run_worker(config, binding, temporary, check_only=False)
++            if (response.get("output_scale") != "prediction_target_units"
++                    or response.get("method") != "xgboost_native_tree_shap"
++                    or response.get("feature_dependence") != "tree_path_dependent"):
++                raise ValueError("worker semantics differ")
++            features = pd.read_parquet(temporary / "features.parquet")
++            keys = pd.Index(batch.source[batch.key].to_numpy(), name=batch.key)
++            if not features.index.equals(keys) or list(features) != response["feature_names"]:
++                raise ValueError("worker estimator schema or entity coverage differs")
++            if response["n_rows"] != len(keys) or response["n_features"] != len(features.columns):
++                raise ValueError("worker row/feature counts differ")
++            tolerance = RegressionTolerance(config.prediction_atol, config.prediction_rtol)
++            with np.load(temporary / "contributions.npz", allow_pickle=False) as values:
++                if set(values.files) != {"contributions", "base_values", "predictions"}:
++                    raise ValueError("unexpected contribution array schema")
++                result = build_regression_explanation(features, values["contributions"],
++                    values["base_values"], values["predictions"], tolerance=tolerance)
++            reproduced = pd.read_parquet(temporary / "reproduced_predictions.parquet")
++            expected = batch.predictions.set_index(batch.key).loc[keys]
++            if (not reproduced.index.equals(keys)
++                    or set(reproduced) != set(expected) - {"scoring_batch_id"}
++                    or not reproduced.release_id.eq(batch.release_id).all()):
++                raise ValueError("reproduced prediction identity/schema differs")
++            for name in ("y_pred_raw", "y_pred_release"):
++                if not np.allclose(reproduced[name], expected[name],
++                                   atol=config.prediction_atol, rtol=config.prediction_rtol):
++                    raise ValueError("saved prediction parity failed")
++            if not np.allclose(result.rows.y_pred_raw, reproduced.y_pred_raw,
++                               atol=config.prediction_atol, rtol=config.prediction_rtol):
++                raise ValueError("SHAP prediction differs from released prediction")
++        validate_groups(config, list(features))
++        rows = result.rows.copy()
++        rows["y_pred_release"] = reproduced.y_pred_release
++        for name, value in (("release_id", batch.release_id), ("scoring_batch_id", batch.batch_id),
++                            ("explanation_id", identity)):
++            rows[name] = value
++        rows.to_parquet(stage / "rows.parquet", index=True)
++        features.to_parquet(stage / "features.parquet", index=True)
++        result.contributions.to_parquet(stage / "contributions.parquet", index=True)
++        ranking = global_summary(result)
++        ranking.to_parquet(stage / "global_summary.parquet", index=False)
++        if config.groups:
++            from ml_template.explainability.summaries import grouped_summary
++            grouped_summary(result, config.groups).to_parquet(stage / "group_summary.parquet", index=False)
++        summary = {"schema_version": 2, "task": "regression", "artifact_state": "complete",
++                   "explanation_id": identity, "release_id": batch.release_id,
++                   "scoring_batch_id": batch.batch_id, "target_unit": config.target_unit,
++                   "n_rows": len(rows), "n_features": len(features.columns), "n_flagged": None,
++                   "parent_run_id": batch.summary["parent_run_id"], "calibration_id": None,
++                   "method": result.method, "output_scale": result.output_scale,
++                   "feature_dependence": result.feature_dependence,
++                   "predictor_kind": response["predictor_kind"],
++                   "varying_feature_values": response["varying_feature_values"],
++                   "persisted_scoring_batch_verified": True, "labels_loaded": False,
++                   "population": "complete_original_scoring_batch",
++                   "created_at": datetime.now(UTC).isoformat()}
++        write_json(stage / "summary.json", summary)
++        write_json(stage / "config.json", config.model_dump())
++        write_json(stage / "verification.json", {**result.verification, "saved_batch_parity": response})
++        write_json(stage / "feature_metadata.json", {"schema_version": 1, "features": [
++            {"name": name, "kind": "estimator_input",
++             "value_semantics": "varies_across_members" if name in response["varying_feature_values"]
++                                else "saved_estimator_representation"}
++            for name in features]})
++        write_json(stage / "provenance.json", {"schema_version": 2, "source_binding": binding,
++                   "binding_sha256": binding["binding_sha256"], "inference_worker": response,
++                   "orchestration_runtime": before, "source_manifests_modified": False,
++                   "units_are_operator_declared": True})
++        message = ("Contributions reconstruct continuous predictions in declared target units. "
++                   "These are estimator-space, tree-path-dependent attributions, not causes or "
++                   "source-feature redistribution. CV contributions and baselines use saved member "
++                   "weights. Dependence is disabled where fold transforms produce different values. "
++                   "No target labels were loaded. Units are declared, not inferred.")
++        (stage / "report.md").write_text("# Regression explanations\n\n" + message + "\n\n" + ranking.to_csv(index=False))
++        (stage / "report.html").write_text("<!doctype html><meta charset='utf-8'><h1>Regression explanations</h1><p>" +
++            html.escape(message) + "</p><p>Units: " + html.escape(config.target_unit) + "</p>" +
++            ranking.to_html(index=False, escape=True))
++        if inspect(config)[1] != binding or authoring_runtime() != before:
++            raise ValueError("source binding or orchestration code changed during explanation")
++        manifest = seal_explanation(stage, identity)
++        verify_explanation(stage, identity)
++        stage.rename(destination)
++        published = True
++        registry.finish(config.registry_path, identity, duration_s=time.perf_counter()-started,
++                        manifest=manifest, n_rows=len(rows), n_features=len(features.columns))
++        return {"status": "succeeded", "explanation_id": identity, "artifact_dir": str(destination),
++                "task": "regression", "release_id": batch.release_id,
++                "scoring_batch_id": batch.batch_id, "n_rows": len(rows)}
++    except Exception as exc:
++        failed = destination if published else stage
++        if registered:
++            registry.finish(config.registry_path, identity, duration_s=time.perf_counter()-started,
++                            error=str(exc), artifact_dir=failed)
++        raise
+--- /dev/null
++++ b/src/ml_template/explainability/regression_presentation.py
+@@ -0,0 +1,80 @@
++"""Read-only validation of saved regression explanations; no inference imports."""
++from pathlib import Path
++import numpy as np
++import pandas as pd
++from ml_template.explainability.artifacts import fingerprint, read_json, verify_explanation
++from ml_template.explainability.regression_result import (
++    RegressionTolerance, build_regression_explanation, global_summary,
++)
++
++
++def load_view(record, summary, manifest, directory, *, max_rows):
++    from ml_template.explainability.presentation_data import ExplanationView
++    directory = Path(directory)
++    if (summary.get("schema_version") != 2 or summary.get("task") != "regression"
++            or summary.get("artifact_state") != "complete"
++            or summary.get("output_scale") != "prediction_target_units"
++            or summary.get("method") != "xgboost_native_tree_shap"
++            or summary.get("feature_dependence") != "tree_path_dependent"
++            or summary.get("persisted_scoring_batch_verified") is not True
++            or summary.get("labels_loaded") is not False
++            or not isinstance(summary.get("target_unit"), str) or not summary["target_unit"].strip()
++            or type(summary.get("n_rows")) is not int or not 0 < summary["n_rows"] <= max_rows):
++        raise ValueError("unsupported regression explanation semantics or row limit")
++    rows = pd.read_parquet(directory / "rows.parquet")
++    required = {"base_value", "y_pred_raw", "y_pred_release", "y_pred_reconstructed",
++                "additivity_residual", "release_id", "scoring_batch_id", "explanation_id"}
++    if not rows.columns.is_unique or set(rows) != required or len(rows) != summary["n_rows"]:
++        raise ValueError("unexpected regression explanation row schema")
++    keys = rows.index.tolist()
++    if not (all(isinstance(k, str) for k in keys) or all(
++            isinstance(k, (int, np.integer)) and not isinstance(k, (bool, np.bool_)) for k in keys)):
++        raise ValueError("unsupported entity key types")
++    for name in ("release_id", "scoring_batch_id", "explanation_id"):
++        if not rows[name].eq(summary[name]).all():
++            raise ValueError("row identity differs")
++    features = pd.read_parquet(directory / "features.parquet")
++    contributions = pd.read_parquet(directory / "contributions.parquet")
++    if not features.index.equals(rows.index) or not contributions.index.equals(rows.index):
++        raise ValueError("explanation entity order differs")
++    if not features.columns.equals(contributions.columns) or features.shape[1] != summary["n_features"]:
++        raise ValueError("estimator feature schema differs")
++    verification = read_json(directory / "verification.json")
++    if verification.get("passed") is not True or verification.get("labels_loaded") is not False:
++        raise ValueError("unverified regression explanation")
++    tol = RegressionTolerance(**verification["tolerance"])
++    result = build_regression_explanation(features, contributions, rows.base_value,
++                                         rows.y_pred_raw, tolerance=tol)
++    if not np.allclose(rows.y_pred_release.to_numpy(float), rows.y_pred_raw.to_numpy(float),
++                       atol=tol.prediction_atol, rtol=tol.prediction_rtol):
++        raise ValueError("raw release prediction differs")
++    for name in ("y_pred_reconstructed", "additivity_residual"):
++        if not np.allclose(rows[name].to_numpy(float), result.rows[name].to_numpy(float),
++                           atol=tol.prediction_atol, rtol=tol.prediction_rtol):
++            raise ValueError("stored reconstruction differs")
++    provenance = read_json(directory / "provenance.json")
++    binding = dict(provenance["source_binding"])
++    claimed = binding.pop("binding_sha256")
++    if (fingerprint(binding) != claimed or claimed != record["binding_sha256"]
++            or binding["release_id"] != summary["release_id"]
++            or binding["scoring_batch_id"] != summary["scoring_batch_id"]):
++        raise ValueError("source binding differs")
++    metadata = read_json(directory / "feature_metadata.json")
++    if [item["name"] for item in metadata["features"]] != list(features):
++        raise ValueError("estimator feature metadata differs")
++    varying = summary.get("varying_feature_values", [])
++    if not isinstance(varying, list) or not set(varying) <= set(features):
++        raise ValueError("invalid varying member feature declaration")
++    ranking = pd.read_parquet(directory / "global_summary.parquet")
++    expected = global_summary(result)
++    if (ranking.feature.duplicated().any() or set(ranking.feature) != set(expected.feature)
++            or len(ranking) != len(expected)):
++        raise ValueError("global ranking feature coverage differs")
++    actual = ranking.set_index("feature").loc[expected.feature]
++    if not np.allclose(actual.mean_abs_contribution, expected.mean_abs_contribution,
++                       atol=1e-10, rtol=1e-8):
++        raise ValueError("global importance differs from contributions")
++    if verify_explanation(directory, summary["explanation_id"]) != manifest:
++        raise ValueError("explanation changed during presentation loading")
++    return ExplanationView(record, summary, rows, features, contributions, expected,
++                           metadata, verification, manifest)
+--- /dev/null
++++ b/src/ml_template/explainability/regression_figures.py
+@@ -0,0 +1,41 @@
++"""Pure sampled signed-contribution scatter distributions in target units."""
++from html import escape
++import numpy as np
++import pandas as pd
++import plotly.graph_objects as go
++
++
++def distribution_figure(view, *, top_n=10, max_points=2000):
++    if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in (top_n, max_points)):
++        raise ValueError("positive figure limits required")
++    order = np.argsort(view.rows.index.to_numpy(), kind="stable")
++    positions = order[np.linspace(0, len(order)-1, min(max_points, len(order)), dtype=int)]
++    figure = go.Figure()
++    top = view.importance.head(top_n).feature.tolist()[::-1]
++    for i, name in enumerate(top):
++        values = view.features[name].iloc[positions]
++        numeric = pd.api.types.is_numeric_dtype(values.dtype)
++        colors = None
++        if numeric and name not in view.summary.get("varying_feature_values", []):
++            observed = values.to_numpy(dtype=float, na_value=np.nan)
++            finite = np.isfinite(observed)
++            if finite.any():
++                low, high = np.min(observed[finite]), np.max(observed[finite])
++                colors = np.full(len(values), .5)
++                colors[finite] = (observed[finite]-low)/(high-low) if high > low else .5
++        jitter = ((np.arange(len(positions))*0.61803398875) % 1 - .5) * .55
++        marker = {"size": 5, "opacity": .65}
++        if colors is not None:
++            marker.update(color=colors, colorscale="RdBu_r", cmin=0, cmax=1)
++        else:
++            marker.update(color="gray")
++        figure.add_trace(go.Scattergl(x=view.contributions[name].iloc[positions], y=i+jitter,
++            mode="markers", name=escape(name), showlegend=False, marker=marker,
++            text=[escape(str(key)) for key in view.rows.index[positions]],
++            hovertemplate="Entity: %{text}<br>Contribution: %{x}<extra></extra>"))
++    figure.add_vline(x=0, line_dash="dot", line_color="gray")
++    figure.update_layout(template="plotly_white", height=max(400, 45*len(top)),
++        title=f"Signed SHAP distributions — {len(positions)} of {len(view.rows)} rows (jittered)",
++        xaxis_title="Contribution (" + escape(view.summary["target_unit"]) + ")",
++        yaxis={"tickvals": list(range(len(top))), "ticktext": [escape(n) for n in top]})
++    return figure
+--- /dev/null
++++ b/tests/explainability/test_regression_explanation_core.py
+@@ -0,0 +1,95 @@
++import json
++from types import SimpleNamespace
++import numpy as np
++import pandas as pd
++import pytest
++from ml_template.explainability.regression_result import (
++    RegressionTolerance, build_regression_explanation, global_summary,
++)
++
++
++def sample():
++    X = pd.DataFrame({"a": [1., 2.], "b": [3., np.nan]}, index=pd.Index(["x", "y"], name="id"))
++    phi = pd.DataFrame({"a": [2., -3.], "b": [-1., 1.]}, index=X.index)
++    base = pd.Series([10., -5.], index=X.index)
++    return X, phi, base, pd.Series([11., -7.], index=X.index)
++
++
++def test_continuous_predictions_baseline_and_owned_copies():
++    X, phi, base, predicted = sample()
++    result = build_regression_explanation(X, phi, base, predicted)
++    np.testing.assert_allclose(result.rows.y_pred_reconstructed, [11., -7.])
++    assert result.output_scale == "prediction_target_units"
++    X.iloc[0, 0] = 999
++    phi.iloc[0, 0] = 999
++    assert result.features.a.iloc[0] == 1
++    assert result.contributions.a.iloc[0] == 2
++    json.dumps(result.verification, allow_nan=False)
++
++
++@pytest.mark.parametrize("fault", ["additivity", "shape", "nan", "boolean", "strings", "swapped_labels"])
++def test_invalid_contributions_rejected(fault):
++    X, phi, base, predicted = sample()
++    if fault == "additivity": phi = phi + 1
++    elif fault == "shape": phi = np.zeros((2, 3))
++    elif fault == "nan": phi.iloc[0, 0] = np.nan
++    elif fault == "boolean": phi = np.zeros((2, 2), dtype=bool)
++    elif fault == "strings": phi = np.array([["2", "-1"], ["-3", "1"]])
++    else: phi = phi.iloc[::-1]
++    with pytest.raises(ValueError):
++        build_regression_explanation(X, phi, base, predicted)
++
++
++@pytest.mark.parametrize("fault", ["duplicate_key", "null_key", "duplicate_feature", "multiindex", "empty"])
++def test_invalid_features_rejected(fault):
++    X, phi, base, predicted = sample()
++    if fault == "duplicate_key": X.index = [1, 1]
++    elif fault == "null_key": X.index = [1, None]
++    elif fault == "duplicate_feature": X.columns = ["a", "a"]
++    elif fault == "multiindex": X.index = pd.MultiIndex.from_tuples([(1, 2), (3, 4)])
++    else: X = X.iloc[:0]
++    with pytest.raises(ValueError):
++        build_regression_explanation(X, phi, base, predicted)
++
++
++@pytest.mark.parametrize("bad", [-1, np.nan, np.inf, True, "1e-5"])
++def test_invalid_tolerances(bad):
++    with pytest.raises(ValueError):
++        RegressionTolerance(prediction_atol=bad)
++
++
++def test_prediction_label_mismatch():
++    X, phi, base, predicted = sample()
++    with pytest.raises(ValueError):
++        build_regression_explanation(X, phi, base, predicted.iloc[::-1])
++
++
++def test_global_summary_uses_mean_absolute_signed_contributions():
++    result = build_regression_explanation(*sample())
++    ranking = global_summary(result).set_index("feature")
++    assert ranking.loc["a", "mean_abs_contribution"] == 2.5
++    assert ranking.loc["a", "mean_contribution"] == -.5
++    assert ranking.loc["b", "mean_abs_contribution"] == 1
++
++
++def test_cv_weighted_shap_explains_mean_prediction():
++    X, phi, base, predicted = sample()
++    phi2, base2 = phi * 2, base + 3
++    combined = .5*phi + .5*phi2
++    baseline = .5*base + .5*base2
++    mean_prediction = .5*predicted + .5*(base2 + phi2.sum(axis=1))
++    result = build_regression_explanation(X, combined, baseline, mean_prediction)
++    np.testing.assert_allclose(result.rows.y_pred_reconstructed, mean_prediction)
++
++
++def test_regression_distribution_figure_uses_target_units():
++    pytest.importorskip("plotly")
++    from ml_template.explainability.regression_figures import distribution_figure
++    result = build_regression_explanation(*sample())
++    view = SimpleNamespace(rows=result.rows, features=result.features, contributions=result.contributions,
++                           importance=global_summary(result),
++                           summary={"target_unit": "target_units", "varying_feature_values": []})
++    figure = distribution_figure(view, max_points=1)
++    assert "target_units" in figure.layout.xaxis.title.text
++    assert len(figure.data) == 2
++    assert len(figure.data[0].x) == 1
+--- /dev/null
++++ b/tests/explainability/test_regression_explanation_native.py
+@@ -0,0 +1,84 @@
++"""Synthetic native Tree SHAP and registered-release dashboard replay."""
++import importlib.util
++from pathlib import Path
++import sqlite3
++import sys
++from types import SimpleNamespace
++import numpy as np
++import pandas as pd
++import pytest
++
++
++def test_native_contributions_use_saved_tree_range(tmp_path):
++    xgb = pytest.importorskip("xgboost", minversion="2.0")
++    from ml_template.explainability.regression_worker import native_contributions
++    X = pd.DataFrame({"a": np.linspace(-2, 2, 40), "b": np.arange(40) % 3})
++    y = X.a * 3 - X.b
++    model = xgb.XGBRegressor(objective="reg:squarederror", n_estimators=10,
++                             max_depth=2, n_jobs=1, tree_method="hist")
++    model.fit(X, y)
++    path = tmp_path / "model.ubj"
++    model.get_booster().save_model(path)
++    booster = xgb.Booster()
++    booster.load_model(path)
++    adapter = SimpleNamespace(_booster=lambda: booster)
++    expanded, phi, base = native_contributions(adapter, X)
++    assert expanded.equals(X)
++    np.testing.assert_allclose(base + phi.sum(axis=1), model.predict(X), atol=1e-5, rtol=1e-5)
++
++
++@pytest.mark.parametrize("engineered", [False, True])
++@pytest.mark.parametrize("predictor_kind", ["final", "cv_mean"])
++def test_regression_explanation_release_replay(tmp_path, monkeypatch, engineered, predictor_kind):
++    pytest.importorskip("pyarrow")
++    pytest.importorskip("sqlalchemy")
++    pytest.importorskip("xgboost", minversion="2.0")
++    import ml_template
++    from ml_template.scoring import batch as scoring
++    original, captured = scoring.score_batch, []
++    def capture(engine, *args, **kwargs):
++        result = original(engine, *args, **kwargs)
++        if not kwargs.get("check_only", False) and result.get("status") == "succeeded":
++            captured.append(result)
++        return result
++    monkeypatch.setattr(scoring, "score_batch", capture)
++    source = Path(__file__).parents[1] / "scoring/test_fitted_regression_pipeline_integration.py"
++    spec = importlib.util.spec_from_file_location("regression_shap_acceptance", source)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    module.test_fitted_regression_end_to_end(tmp_path, monkeypatch, engineered, predictor_kind)
++    scored = captured[-1]
++    database = tmp_path / "project.db"
++    with sqlite3.connect(database) as conn:
++        release_dir = conn.execute("SELECT artifact_dir FROM model_releases WHERE release_id=?",
++                                   (scored["release_id"],)).fetchone()[0]
++    from ml_template.explainability.explanation_config import ExplanationConfig
++    from ml_template.explainability.explain_batch import explain_batch
++    from ml_template.explainability.presentation_data import load_explanation
++    config = ExplanationConfig(task="regression", target_unit="synthetic_units",
++        release_dir=release_dir, scoring_dir=scored["artifact_dir"],
++        expected_release_id=scored["release_id"], expected_scoring_batch_id=scored["scoring_batch_id"],
++        runtime_python=sys.executable, runtime_source_root=str(Path(ml_template.__file__).parent),
++        registry_path=str(database), output_root=str(tmp_path / "explanations"), chunk_size=1).resolved(tmp_path)
++    checked = explain_batch(config, check_only=True)
++    assert checked["ready"] and checked["predictions_computed"] is False
++    explained = explain_batch(config)
++    assert explained["status"] == "succeeded"
++    # Presentation must not deserialize a model or call prediction.
++    from ml_template.models import model_factory
++    def forbidden(*args, **kwargs):
++        raise AssertionError("presentation loaded a model")
++    monkeypatch.setattr(model_factory, "load_adapter", forbidden)
++    view = load_explanation(database, explained["explanation_id"])
++    np.testing.assert_allclose(view.rows.base_value + view.contributions.sum(axis=1),
++                               view.rows.y_pred_release, atol=1e-5, rtol=1e-5)
++    assert view.summary["output_scale"] == "prediction_target_units"
++    from ml_template.usage_dashboard.app import global_payload, local_payload
++    assert "y_pred_release" in {col["id"] for col in global_payload(database, explained["explanation_id"])[6]}
++    assert "y_pred_release" in local_payload(database, explained["explanation_id"], 0)[2]
++    # Hash tampering is rejected by the artifact/presentation boundary.
++    path = Path(explained["artifact_dir"]) / "contributions.parquet"
++    with path.open("ab") as handle:
++        handle.write(b"tampered")
++    with pytest.raises(ValueError):
++        load_explanation(database, explained["explanation_id"])
+--- /dev/null
++++ b/tests/explainability/test_regression_explanation_bridge.py
+@@ -0,0 +1,48 @@
++"""IPC contract tests with a simulated subprocess, not native inference tests."""
++import json
++import sys
++from pathlib import Path
++from types import SimpleNamespace
++import pytest
++from ml_template.explainability import regression_bridge as bridge
++from ml_template.explainability.artifacts import sha256
++
++
++@pytest.mark.parametrize("fault", [None, "binding", "worker_hash", "labels", "inference", "exit"])
++def test_isolation_and_fail_closed_response(tmp_path, monkeypatch, fault):
++    source = tmp_path / "pinned/ml_template"
++    source.mkdir(parents=True)
++    (source / "__init__.py").touch()
++    executable = tmp_path / "venv-python"
++    executable.symlink_to(sys.executable)
++    output = tmp_path / "ipc"
++    output.mkdir()
++    binding = {"release_id": "rel_a", "scoring_batch_id": "score_a", "binding_sha256": "hash_a"}
++    config = SimpleNamespace(runtime_python=str(executable), runtime_source_root=str(source),
++        release_dir="release", scoring_dir="scores", chunk_size=2, max_rows=10,
++        prediction_atol=1e-5, prediction_rtol=1e-5, timeout_seconds=20)
++    monkeypatch.setenv("PYTHONPATH", "must_not_reach_worker")
++    def simulated(command, **kwargs):
++        assert command[0] == str(executable) and command[1] == "-I"
++        assert "PYTHONPATH" not in kwargs["env"]
++        worker = Path(command[2])
++        assert not worker.is_relative_to(source)
++        request = json.loads((output / "request.json").read_text())
++        assert request["binding"] == binding
++        response = {"ready": True, **binding, "task": "regression",
++                    "runtime_source_root": str(source), "worker_sha256": sha256(worker),
++                    "labels_loaded": False, "model_deserialized": False,
++                    "predictions_computed": False}
++        if fault == "binding": response["release_id"] = "wrong"
++        elif fault == "worker_hash": response["worker_sha256"] = "wrong"
++        elif fault == "labels": response["labels_loaded"] = True
++        elif fault == "inference": response["predictions_computed"] = True
++        (output / "response.json").write_text(json.dumps(response))
++        return SimpleNamespace(returncode=1 if fault == "exit" else 0, stderr="test failure")
++    monkeypatch.setattr(bridge.subprocess, "run", simulated)
++    if fault:
++        with pytest.raises(ValueError):
++            bridge.run_worker(config, binding, output, check_only=True)
++    else:
++        result = bridge.run_worker(config, binding, output, check_only=True)
++        assert result["predictions_computed"] is False
+--- /dev/null
++++ b/configs/explanations/regression_batch.example.yaml
+@@ -0,0 +1,18 @@
++schema_version: 1
++task: regression
++target_unit: target_units  # Replace with your declared target unit.
++release_dir: artifacts/releases/REPLACE_RELEASE_ID
++scoring_dir: artifacts/scores/REPLACE_SCORING_BATCH_ID
++expected_release_id: REPLACE_RELEASE_ID
++expected_scoring_batch_id: REPLACE_SCORING_BATCH_ID
++# Choose an interpreter that imports the EXACT runtime recorded by this release.
++runtime_python: /REPLACE_WITH_PINNED_ENV/bin/python
++runtime_source_root: /REPLACE_WITH_PINNED_CHECKOUT/src/ml_template
++registry_path: data/project.db
++output_root: artifacts/explanations
++chunk_size: 256
++max_rows: 100000
++timeout_seconds: 600
++prediction_atol: 0.00001
++prediction_rtol: 0.00001
++groups: {}

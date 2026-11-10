@@ -9,6 +9,14 @@ import plotly.graph_objects as go
 from ml_template.explainability.presentation_data import selected_entity
 
 
+def output_unit(view):
+    return (
+        escape(view.summary["target_unit"])
+        if getattr(view, "summary", {}).get("task") == "regression"
+        else "log-odds"
+    )
+
+
 def placeholder(message):
     figure = go.Figure()
     figure.add_annotation(
@@ -40,13 +48,19 @@ def importance_figure(view, top_n=20):
     figure.update_layout(
         template="plotly_white",
         title=f"Global importance — all {len(view.rows)} scoring rows",
-        xaxis_title="Mean absolute contribution (log-odds)",
+        xaxis_title=f"Mean absolute contribution ({output_unit(view)})",
         height=max(400, 30 * len(table)),
     )
     return figure
 
 
 def distribution_figure(view, *, top_n=10, max_points=2000):
+    if getattr(view, "summary", {}).get("task") == "regression":
+        from ml_template.explainability.regression_figures import (
+            distribution_figure as regression_distribution,
+        )
+
+        return regression_distribution(view, top_n=top_n, max_points=max_points)
     positions = sample_positions(view, max_points)
     figure = go.Figure()
     for name in view.importance.head(top_n).feature:
@@ -70,6 +84,10 @@ def distribution_figure(view, *, top_n=10, max_points=2000):
 
 
 def dependence_figure(view, feature, *, max_points=2000):
+    if feature in getattr(view, "summary", {}).get("varying_feature_values", []):
+        return placeholder(
+            "Dependence unavailable: this estimator input differs across fold transforms"
+        )
     if feature not in view.features:
         raise ValueError("feature not found in saved estimator inputs")
     positions = sample_positions(view, max_points)
@@ -77,7 +95,11 @@ def dependence_figure(view, feature, *, max_points=2000):
     numeric = pd.api.types.is_numeric_dtype(values.dtype) and not pd.api.types.is_bool_dtype(
         values.dtype
     )
-    x = values.to_numpy() if numeric else [escape(str(v)) for v in values]
+    x = (
+        values.to_numpy(dtype=float, na_value=np.nan)
+        if numeric
+        else [escape(str(v)) for v in values]
+    )
     keys = [escape(str(k)) for k in view.rows.index[positions]]
     figure = go.Figure(
         go.Scattergl(
@@ -86,10 +108,18 @@ def dependence_figure(view, feature, *, max_points=2000):
             mode="markers",
             text=keys,
             marker={
-                "color": view.rows.p_release.iloc[positions],
+                "color": view.rows[
+                    "y_pred_release"
+                    if getattr(view, "summary", {}).get("task") == "regression"
+                    else "p_release"
+                ].iloc[positions],
                 "colorscale": "Viridis",
                 "showscale": True,
-                "colorbar": {"title": "Release<br>probability"},
+                "colorbar": {
+                    "title": "Release prediction"
+                    if getattr(view, "summary", {}).get("task") == "regression"
+                    else "Release<br>probability"
+                },
                 "size": 6,
                 "opacity": 0.7,
             },
@@ -101,7 +131,7 @@ def dependence_figure(view, feature, *, max_points=2000):
         template="plotly_white",
         title=f"{escape(str(feature))} — {len(positions)} sampled rows",
         xaxis_title=escape(str(feature)),
-        yaxis_title="Contribution (log-odds)",
+        yaxis_title=f"Contribution ({output_unit(view)})",
         height=450,
     )
     return figure
@@ -121,7 +151,13 @@ def waterfall_figure(view, position, *, max_features=12):
         go.Waterfall(
             orientation="h",
             measure=["absolute", *(["relative"] * len(values)), "total"],
-            y=["Baseline", *names, "Prediction margin"],
+            y=[
+                "Baseline",
+                *names,
+                "Prediction"
+                if getattr(view, "summary", {}).get("task") == "regression"
+                else "Prediction margin",
+            ],
             x=[float(row.base_value), *values, 0],
             connector={"line": {"color": "gray"}},
             increasing={"marker": {"color": "#c44240"}},
@@ -130,8 +166,15 @@ def waterfall_figure(view, position, *, max_features=12):
     )
     figure.update_layout(
         template="plotly_white",
-        title=f"Entity {escape(str(key))}: base-model explanation",
-        xaxis_title="Base-model log-odds — not probability percentage points",
+        title=f"Entity {escape(str(key))}: "
+        + (
+            "released predictor explanation"
+            if getattr(view, "summary", {}).get("task") == "regression"
+            else "base-model explanation"
+        ),
+        xaxis_title=f"Prediction ({output_unit(view)})"
+        if getattr(view, "summary", {}).get("task") == "regression"
+        else "Base-model log-odds — not probability percentage points",
         height=max(450, 33 * (len(values) + 2)),
         yaxis={"autorange": "reversed"},
     )
