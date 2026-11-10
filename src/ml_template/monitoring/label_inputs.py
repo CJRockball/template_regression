@@ -43,7 +43,12 @@ def validate_labels(frame, batch):
         raise ValueError("label snapshot must cover exactly the specified scoring batch")
     out = frame.copy()
     present = out.y_true.notna()
-    if not out.loc[present, "y_true"].isin([0, 1]).all():
+    regression = getattr(batch, "task", "binary_classification") == "regression"
+    if regression:
+        from ml_template.monitoring.regression import validate_outcomes
+
+        out["y_true"] = validate_outcomes(out.y_true)
+    elif not out.loc[present, "y_true"].isin([0, 1]).all():
         raise ValueError("labels must be 0, 1, or missing")
     if not out.loc[present, "y_true"].map(lambda v: not isinstance(v, (bool, np.bool_))).all():
         raise ValueError("boolean labels are not supported")
@@ -53,12 +58,15 @@ def validate_labels(frame, batch):
     out["observed_at"] = pd.to_datetime(
         out.observed_at.map(lambda v: timestamp(v) if pd.notna(v) else pd.NaT), utc=True
     )
-    out["y_true"] = out.y_true.astype("Int64")
+    out["y_true"] = out.y_true.astype("Float64" if regression else "Int64")
     return out.set_index(key).loc[batch.predictions[key]].reset_index()
 
 
 def import_labels(engine, config, *, output_root, check_only=False):
     batch = load_batch(engine, config.scoring_batch_id)
+    from ml_template.monitoring.regression import validate_options
+
+    validate_options(batch, config)
     path = config.input_path.resolve()
     if path.suffix.lower() not in {".csv", ".parquet"}:
         raise ValueError("labels require .csv or .parquet")
@@ -74,6 +82,8 @@ def import_labels(engine, config, *, output_root, check_only=False):
         raise ValueError("label input changed during validation")
     if config.supersedes_label_import_id:
         prior = load_labels(engine, config.supersedes_label_import_id, batch)
+        if prior["metadata"].get("target_unit") != config.target_unit:
+            raise ValueError("corrected snapshots must preserve target units")
         if prior["metadata"]["outcome_definition"] != config.outcome_definition:
             raise ValueError("corrected snapshots must preserve the outcome definition")
     if check_only:

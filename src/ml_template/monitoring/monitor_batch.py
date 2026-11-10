@@ -151,6 +151,9 @@ def prepare(engine, config):
     reference = load_reference(engine, config.reference_id, batch)
     labels = load_labels(engine, config.label_import_id, batch) if config.label_import_id else None
     quality_report(batch, config.quality_ranges)
+    from ml_template.monitoring.regression import validate_options
+
+    validate_options(batch, config, reference=reference, labels=labels)
     return batch, reference, labels
 
 
@@ -176,11 +179,21 @@ def evaluate(engine, config, *, output_root, check_only=False):
         for name, item in reference["profiles"].items():
             scope, column = name.split(":", 1)
             source = batch.source if scope == "input" else batch.predictions
-            drift.append({"name": name, **compare(source[column], item)})
+            from ml_template.monitoring.nullable_drift import nullable_compare
+
+            comparator = nullable_compare if item.get("kind") == "nullable_v1" else compare
+            drift.append({"name": name, **comparator(source[column], item)})
         performance, sampling = None, None
         if labels:
             sampling = labels["metadata"]["sampling"]
-            performance = evaluate_predictions(
+            evaluator = evaluate_predictions
+            if batch.task == "regression":
+                from ml_template.monitoring.regression import (
+                    evaluate_predictions as evaluate_regression,
+                )
+
+                evaluator = evaluate_regression
+            performance = evaluator(
                 batch.predictions,
                 labels["frame"],
                 batch.key,
@@ -189,7 +202,12 @@ def evaluate(engine, config, *, output_root, check_only=False):
                 min_positives=config.min_positives,
                 min_negatives=config.min_negatives,
             )
-        findings = findings_for(
+        finder = findings_for
+        if batch.task == "regression":
+            from ml_template.monitoring.regression import findings as regression_findings
+
+            finder = regression_findings
+        findings = finder(
             config,
             drift=drift,
             quality=quality,
@@ -236,6 +254,21 @@ def evaluate(engine, config, *, output_root, check_only=False):
                 "Integrity hashes are not signatures",
             ],
         }
+        if batch.task == "regression":
+            summary.update(
+                schema_version=2,
+                task="regression",
+                target_unit=config.target_unit,
+                prediction_kind="continuous",
+                limitations=[
+                    "Descriptive comparisons, not significance tests",
+                    "No automatic retraining or promotion",
+                    "Outcome metrics describe the labelled mature subset",
+                    "Distribution stability does not establish predictive accuracy",
+                    "Units are explicit operator declarations, not inferred conversions",
+                    "Integrity hashes are not signatures",
+                ],
+            )
         write_json(directory / "config.json", config.model_dump(mode="json"))
         write_json(directory / "quality.json", quality)
         write_json(directory / "drift.json", drift)

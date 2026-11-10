@@ -1,0 +1,6 @@
+schema_version: 1
+scoring_batch_id: REPLACE_REFERENCE_SCORE_BATCH_ID
+name: Approved regression reference
+approved_population: Describe the approved operational reference population
+numeric_bins: 10
+target_unit: target_units
