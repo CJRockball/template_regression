@@ -50,8 +50,9 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     cfg = RunConfig.model_validate_json((run_dir / "config.json").read_text())
     if cfg.task != "regression" or cfg.model.type != "xgb":
         raise ValueError("Expected XGB regression parent")
-    if cfg.fitted_features:
-        raise ValueError("Fitted/learned regression transforms remain unsupported")
+    from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+    validate_regression_specs(cfg.fitted_features)
     if config_hash(cfg) != parent["config_hash"]:
         raise ValueError("Parent config hash disagrees with registry")
     for name in ["silver_dataset_version_id", "feature_set_id"]:
@@ -87,8 +88,8 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     if not features or len(features) != len(set(features)) or set(features) & {key, target}:
         raise ValueError("Invalid feature roles")
     info = json.loads((run_dir / "features.json").read_text())
-    if info.get("fitted_features"):
-        raise ValueError("Fitted model input recipes remain unsupported")
+    if (info.get("fitted_features") or []) != (cfg.fitted_features or []):
+        raise ValueError("Saved fitted feature specification differs from run config")
     split_id = compute_split_id(cfg.data.silver_dataset_version_id, cfg.split, key, target)
     if parent["split_id"] != split_id or info["split_id"] != split_id:
         raise ValueError("Split identity differs")
@@ -177,7 +178,7 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         "python": sys.version,
         "holdout_fingerprint": fingerprint,
         "limitations": [
-            "Stateless feature replay supported; fitted transforms and bootstrap intervals remain unsupported"
+            "Stateless replay and target-free fold-fitted transforms supported; bootstrap intervals unsupported"
         ],
         "feature_preparation": preparation,
     }

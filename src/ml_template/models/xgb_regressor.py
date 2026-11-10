@@ -104,6 +104,9 @@ class XGBRegressionAdapter:
         adapter._loaded_booster = booster
         return adapter
 
+    def estimator_feature_names(self):
+        return list(self._booster().feature_names)
+
     def feature_importances(self):
         booster = self._booster()
         scores = booster.get_score(importance_type="gain")

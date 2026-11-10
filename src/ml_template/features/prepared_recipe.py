@@ -194,8 +194,11 @@ def verify_plan(cfg, raw_columns, info, key_col, n_rows, feature_root):
     schema = model_schema(info)
     selected = list(info["features"])
     fsid = cfg.data.feature_set_id
-    if cfg.fitted_features:
-        raise ValueError("Fitted/learned regression transforms remain unsupported")
+    from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+    validate_regression_specs(cfg.fitted_features)
+    if (info.get("fitted_features") or []) != (cfg.fitted_features or []):
+        raise ValueError("Saved fitted feature specification differs from config")
     hashes = {}
     if fsid is None:
         recipe = {
@@ -362,8 +365,11 @@ def validate_packaged(recipe, contract, schema, cfg, provenance, info=None):
         "columns"
     ] != [s["name"] for s in schema]:
         raise ValueError("Packaged source/model schema differs from recipe")
-    if cfg.fitted_features:
-        raise ValueError("Fitted regression transforms remain unsupported")
+    from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+    validate_regression_specs(cfg.fitted_features)
+    if cfg.fitted_features and (info is None or info.get("fitted_features") != cfg.fitted_features):
+        raise ValueError("Packaged fitted specification differs from run config")
     if canonical.get("feature_set_id") != cfg.data.feature_set_id:
         raise ValueError("Recipe feature-set ID differs from run configuration")
     plan = provenance.get("feature_preparation")

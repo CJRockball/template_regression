@@ -6,41 +6,18 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 from ml_template.evaluation.regression_diagnostics import compute_diagnostics, write_diagnostics
 
 
 def load_development(prepared):
-    p = prepared
-    keys = p.assignments.loc[p.assignments.partition.eq("dev"), p.key_col].tolist()
-    frame = pd.read_parquet(
-        p.parquet_path,
-        engine="pyarrow",
-        columns=[p.key_col, *p.feature_names, p.target_col],
-        filters=[(p.key_col, "in", keys)],
-    )
-    if (
-        frame[p.key_col].isna().any()
-        or frame[p.key_col].duplicated().any()
-        or set(frame[p.key_col]) != set(keys)
-    ):
-        raise ValueError("Development-only read returned unexpected key coverage")
-    frame = frame.set_index(p.key_col).sort_index()
-    X = frame[p.feature_names].copy()
-    for name, item in p.feature_info.get("categorical_schema", {}).items():
-        X[name] = X[name].astype(pd.CategoricalDtype(item["categories"], ordered=item["ordered"]))
-    for name, dtype in p.feature_info["dtypes"].items():
-        if str(X[name].dtype) != dtype:
-            raise ValueError(f"Development input dtype differs from saved model: {name}")
-    target = frame[p.target_col]
-    if not pd.api.types.is_numeric_dtype(target) or pd.api.types.is_bool_dtype(target):
-        raise ValueError("Development target must be numeric")
-    y = target.astype(float)
-    if not np.isfinite(y.to_numpy()).all():
-        raise ValueError("Development target must be finite")
-    return X, y
+    from ml_template.features.prepared_recipe import load_partition
+
+    keys = prepared.assignments.loc[
+        prepared.assignments.partition.eq("dev"), prepared.key_col
+    ].tolist()
+    return load_partition(prepared, keys)
 
 
 def prepare_analysis(engine, run_id):
@@ -183,7 +160,6 @@ def run_saved_analysis(
         result = compute_diagnostics(
             oof, X, y, p.assignments, p.key_col, model_loader=loader, **options
         )
-        # Re-verify source bytes, OOF and original fold artifacts before publishing.
         if sha256(p.parquet_path) != p.provenance["input_hashes"]["silver_parquet"]:
             raise ValueError("Silver bytes changed while analysing development rows")
         from ml_template.tracking.run_artifacts import verify_artifact
@@ -191,6 +167,9 @@ def run_saved_analysis(
         for name in ["config.json", "features.json", "oof_predictions.parquet"]:
             verify_artifact(p.run_dir, name)
         verify_predictor_files(p.run_dir, descriptor)
+        from ml_template.features.prepared_recipe import verify_prepared
+
+        verify_prepared(p)
         write_diagnostics(result, directory, plots=plots)
         write_json(
             directory / "provenance.json",

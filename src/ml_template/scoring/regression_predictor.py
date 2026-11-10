@@ -38,8 +38,11 @@ class RegressionReleasedPredictor:
         from ml_template.training.run_config import RunConfig
 
         cfg = RunConfig.model_validate(read_json(self.directory / "config.json"))
-        if cfg.task != "regression" or cfg.fitted_features:
-            raise ValueError("Unsupported regression feature recipe")
+        if cfg.task != "regression":
+            raise ValueError("Expected regression release config")
+        from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+        validate_regression_specs(cfg.fitted_features)
         descriptor = read_json(self.directory / "predictor.json")
         evidence = read_json(self.directory / "evidence.json")
         provenance, spec = (evidence["provenance"], evidence["evaluation_spec"])

@@ -1,0 +1,10 @@
+# Merge this fragment into an existing regression experiment; not a standalone config.
+# Replace feature_a/feature_b with actual numeric pre-Gold column names.
+fitted_features:
+  - step: numeric_preprocessing
+    columns: [feature_a, feature_b]
+    numeric_strategy: median
+    scaling: none
+    constant_fill: 0.0
+    all_missing_fill: 0.0
+    missing_indicators: true

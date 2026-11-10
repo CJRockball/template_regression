@@ -36,7 +36,7 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     from ml_template.data.contract import load_dataset_contract
     from ml_template.db import model_run_registry as registry
     from ml_template.models.predictor_selection import describe_predictor
-    from ml_template.paths import DATA_SILVER, DATA_SPLITS
+    from ml_template.paths import DATA_FEATURES, DATA_SILVER, DATA_SPLITS
     from ml_template.tracking import run_artifacts as artifacts
     from ml_template.training.run_config import RunConfig, config_hash, resolve_path
     from ml_template.training.split import compute_split_id
@@ -50,8 +50,8 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     cfg = RunConfig.model_validate_json((run_dir / "config.json").read_text())
     if cfg.task != "regression" or cfg.model.type != "xgb":
         raise ValueError("Expected XGB regression parent")
-    if cfg.fitted_features or cfg.data.feature_set_id is not None:
-        raise ValueError("First regression evaluation supports raw Silver features only")
+    if cfg.fitted_features:
+        raise ValueError("Fitted/learned regression transforms remain unsupported")
     if config_hash(cfg) != parent["config_hash"]:
         raise ValueError("Parent config hash disagrees with registry")
     for name in ["silver_dataset_version_id", "feature_set_id"]:
@@ -67,9 +67,10 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     roots = {
         "silver_root": Path(silver_root or DATA_SILVER),
         "split_root": Path(split_root or DATA_SPLITS),
+        "feature_root": Path(feature_root or DATA_FEATURES),
     }
     sd = roots["silver_root"] / cfg.data.dataset_name / cfg.data.silver_dataset_version_id
-    sm_path, parquet = sd / "manifest.json", sd / "data.parquet"
+    sm_path, parquet = (sd / "manifest.json", sd / "data.parquet")
     sm = json.loads(sm_path.read_text())
     if (
         not sm.get("validation_passed")
@@ -80,21 +81,21 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     ids = roles.get("id", roles.get("ids", []))
     targets = roles.get("target", roles.get("targets", []))
     features = roles.get("feature", roles.get("features", []))
-    key, target = contract.entity_id, contract.target
+    key, target = (contract.entity_id, contract.target)
     if key not in ids or targets != [target] or set(features) != set(contract.features):
         raise ValueError("Silver/contract roles disagree")
     if not features or len(features) != len(set(features)) or set(features) & {key, target}:
         raise ValueError("Invalid feature roles")
     info = json.loads((run_dir / "features.json").read_text())
-    if info["features"] != list(features) or info.get("fitted_features"):
-        raise ValueError("Saved input feature order/recipe differs from Silver")
+    if info.get("fitted_features"):
+        raise ValueError("Fitted model input recipes remain unsupported")
     split_id = compute_split_id(cfg.data.silver_dataset_version_id, cfg.split, key, target)
     if parent["split_id"] != split_id or info["split_id"] != split_id:
         raise ValueError("Split identity differs")
     if info["silver_dataset_version_id"] != cfg.data.silver_dataset_version_id:
         raise ValueError("Saved feature metadata Silver identity differs")
     sp = roots["split_root"] / split_id
-    spm_path, assignments_path = sp / "manifest.json", sp / "assignments.parquet"
+    spm_path, assignments_path = (sp / "manifest.json", sp / "assignments.parquet")
     spm = json.loads(spm_path.read_text())
     if (
         spm["silver_dataset_version_id"] != cfg.data.silver_dataset_version_id
@@ -144,6 +145,9 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         fold_ids=fold_ids,
         verify_artifact=artifacts.verify_artifact,
     )
+    from ml_template.features.prepared_recipe import verify_plan
+
+    preparation = verify_plan(cfg, features, info, key, len(assignments), roots["feature_root"])
     hashes = {
         "contract": sha256(contract_path),
         "config": sha256(run_dir / "config.json"),
@@ -153,6 +157,7 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         "split_manifest": sha256(spm_path),
         "assignments": sha256(assignments_path),
         **descriptor["files_sha256"],
+        **preparation["input_hashes"],
     }
     package = Path(__file__).resolve().parents[1]
     code_hashes = {str(p.relative_to(package)): sha256(p) for p in sorted(package.rglob("*.py"))}
@@ -171,7 +176,10 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         "versions": versions,
         "python": sys.version,
         "holdout_fingerprint": fingerprint,
-        "limitations": ["No feature transforms or bootstrap intervals in this patch"],
+        "limitations": [
+            "Stateless feature replay supported; fitted transforms and bootstrap intervals remain unsupported"
+        ],
+        "feature_preparation": preparation,
     }
     identity = digest({"spec": spec.model_dump(mode="json"), "provenance": provenance})
     return PreparedRegression(
@@ -193,41 +201,8 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
 
 
 def load_holdout(prepared):
-    """Called only after the exposure timestamp has been committed."""
-    p = prepared
-    if sha256(p.parquet_path) != p.provenance["input_hashes"]["silver_parquet"]:
-        raise ValueError("Silver data changed after preflight")
-    frame = pd.read_parquet(
-        p.parquet_path,
-        engine="pyarrow",
-        columns=[p.key_col, *p.feature_names, p.target_col],
-        filters=[(p.key_col, "in", p.hold_keys)],
-    )
-    canonical_keys(frame[p.key_col])
-    if set(frame[p.key_col]) != set(p.hold_keys):
-        raise ValueError("Holdout key coverage differs")
-    frame = frame.set_index(p.key_col).loc[p.hold_keys]
-    y = frame[p.target_col]
-    if not pd.api.types.is_numeric_dtype(y) or pd.api.types.is_bool_dtype(y):
-        raise ValueError("Holdout target must be numeric")
-    y = y.to_numpy(dtype=float, na_value=np.nan)
-    if not np.isfinite(y).all():
-        raise ValueError("Holdout target must be finite")
-    X = frame[p.feature_names].copy()
-    categories = p.feature_info.get("categorical_schema", {})
-    for name in X:
-        if name in categories:
-            spec = categories[name]
-            X[name] = X[name].astype(
-                pd.CategoricalDtype(spec["categories"], ordered=spec["ordered"])
-            )
-        elif pd.api.types.is_object_dtype(X[name]) or pd.api.types.is_string_dtype(X[name]):
-            raise ValueError("Text input lacks frozen category schema")
-        if (
-            name in p.feature_info.get("dtypes", {})
-            and str(X[name].dtype) != p.feature_info["dtypes"][name]
-        ):
-            raise ValueError(f"Holdout feature dtype changed: {name}")
-    if sha256(p.parquet_path) != p.provenance["input_hashes"]["silver_parquet"]:
-        raise ValueError("Silver data changed during loading")
-    return X, y
+    """Load only the already-approved holdout after access is recorded."""
+    from ml_template.features.prepared_recipe import load_partition
+
+    X, y = load_partition(prepared, prepared.hold_keys)
+    return X, y.to_numpy(dtype=float)

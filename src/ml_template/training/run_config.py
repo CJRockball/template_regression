@@ -266,8 +266,9 @@ class RunConfig(_Strict):
                 raise ValueError("Regression requires regression metrics")
             if self.metrics.primary == "r2":
                 raise ValueError("Use rmse or mae as the initial primary metric; r2 is diagnostic")
-            if self.fitted_features:
-                raise ValueError("Regression fitted_features are not supported in this first patch")
+            from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+            validate_regression_specs(self.fitted_features)
             if self.analysis.permutation_importance or self.analysis.error_sample_size:
                 raise ValueError("Regression analyses are not implemented; disable them")
         else:

@@ -30,11 +30,13 @@ import pandas as pd
 from ml_template.features.blocks.generic_interactions import PowerTransformStep
 from ml_template.features.group_statistics import GroupStatisticsStep
 from ml_template.features.target_encoding import TargetEncodingStep
+from ml_template.preprocessing.numeric_preprocessing import NumericPreprocessingStep
 
 STEP_TYPES: dict[str, type] = {
     PowerTransformStep.name: PowerTransformStep,
     GroupStatisticsStep.name: GroupStatisticsStep,
     TargetEncodingStep.name: TargetEncodingStep,
+    NumericPreprocessingStep.name: NumericPreprocessingStep,
 }
 
 
@@ -50,6 +52,9 @@ def build_steps(specs: Sequence[Mapping[str, Any]]) -> list[Any]:
             steps.append(STEP_TYPES[kind](**kwargs))
         except TypeError as exc:
             raise ValueError(f"bad {kind} spec {dict(spec)}: {exc}") from exc
+    replacements = [i for i, step in enumerate(steps) if getattr(step, "replacement_stage", False)]
+    if replacements and replacements != [len(steps) - 1]:
+        raise ValueError("numeric_preprocessing must occur once, as the final fitted step")
     return steps
 
 
@@ -62,7 +67,13 @@ class FittedFeatureTransformer:
 
     def __init__(self, specs: Sequence[Mapping[str, Any]]) -> None:
         self.specs = [dict(s) for s in specs]
-        self.steps = build_steps(self.specs)
+        all_steps = build_steps(self.specs)
+        self.preprocessing = (
+            all_steps.pop()
+            if all_steps and getattr(all_steps[-1], "replacement_stage", False)
+            else None
+        )
+        self.steps = all_steps
 
     def fit(
         self, X: pd.DataFrame, y: pd.Series | np.ndarray | None = None
@@ -73,6 +84,9 @@ class FittedFeatureTransformer:
                 step.fit(X, y)
             else:
                 step.fit(X)
+        preprocessing = getattr(self, "preprocessing", None)
+        if preprocessing is not None:
+            preprocessing.fit(self._append(X, [step.transform(X) for step in self.steps]))
         return self
 
     def _append(self, X: pd.DataFrame, outputs: Sequence[pd.DataFrame]) -> pd.DataFrame:
@@ -98,13 +112,22 @@ class FittedFeatureTransformer:
             else:
                 step.fit(X)
                 outputs.append(step.transform(X))
-        return self._append(X, outputs)
+        out = self._append(X, outputs)
+        preprocessing = getattr(self, "preprocessing", None)
+        if preprocessing is not None:
+            preprocessing.fit(out)
+            out = preprocessing.transform(out)
+        return out
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        return self._append(X, [step.transform(X) for step in self.steps])
+        out = self._append(X, [step.transform(X) for step in self.steps])
+        preprocessing = getattr(self, "preprocessing", None)
+        return out if preprocessing is None else preprocessing.transform(out)
 
     def output_columns(self, input_columns: Sequence[str]) -> list[str]:
-        return [*input_columns, *(c for s in self.steps for c in s.output_columns())]
+        columns = [*input_columns, *(c for s in self.steps for c in s.output_columns())]
+        preprocessing = getattr(self, "preprocessing", None)
+        return columns if preprocessing is None else columns + preprocessing.output_columns()
 
     def save(self, path: Path) -> None:
         joblib.dump(self, path)
@@ -164,6 +187,17 @@ class TransformingAdapter:
             metric,
         )
 
+    @property
+    def early_stopping_history(self):
+        return getattr(self.inner, "early_stopping_history", None)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        if self.transformer is None:
+            raise RuntimeError("model is not fitted")
+        if not callable(getattr(self.inner, "predict", None)):
+            raise TypeError("inner adapter does not support regression prediction")
+        return self.inner.predict(self.transformer.transform(X))
+
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         if self.transformer is None:
             raise RuntimeError("model is not fitted")
@@ -205,4 +239,7 @@ class TransformingAdapter:
     ) -> TransformingAdapter:
         adapter = cls(inner, specs)
         adapter.transformer = FittedFeatureTransformer.load(transformer_path(path))
+        from ml_template.preprocessing.numeric_preprocessing import validate_saved_specs
+
+        validate_saved_specs(adapter.transformer, specs)
         return adapter

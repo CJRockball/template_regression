@@ -154,7 +154,11 @@ def run_saved_analysis(
         names = {m["fold_id"]: m["model_path"] for m in descriptor["members"]}
 
         def loader(fold):
-            verify_predictor_files(p.run_dir, descriptor, names=[names[fold]])
+            member = next(m for m in descriptor["members"] if m["fold_id"] == fold)
+            required = [names[fold]]
+            if member["transformer_path"]:
+                required.append(member["transformer_path"])
+            verify_predictor_files(p.run_dir, descriptor, names=required)
             return load_adapter(p.run_cfg, safe_file(p.run_dir, names[fold]))
 
         result = compute_diagnostics(
