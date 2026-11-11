@@ -94,7 +94,9 @@ def make_split(df: pd.DataFrame, cfg: SplitConfig, key_col: str, target_col: str
         stratify=y if cfg.method == "stratified" else None,
         random_state=cfg.seed,
     )
-    dev_idx = np.sort(dev_idx)
+    from ml_template.training.regression_partitions import reserve
+
+    dev_idx, partitions = reserve(len(data), dev_idx, cfg)
     if len(dev_idx) < cfg.n_folds:
         raise ValueError("Development rows must be at least n_folds")
     fold = np.full(len(data), HOLDOUT_FOLD, dtype=int)
@@ -115,7 +117,7 @@ def make_split(df: pd.DataFrame, cfg: SplitConfig, key_col: str, target_col: str
     return pd.DataFrame(
         {
             key_col: data[key_col].to_numpy(),
-            "partition": np.where(fold == HOLDOUT_FOLD, "holdout", "dev"),
+            "partition": partitions,
             "fold": fold,
         }
     )
@@ -145,11 +147,17 @@ def _manifest(
         "n_holdout": int(hold.sum()),
         "fold_sizes": {
             str(k): int(v)
-            for k, v in assignments.loc[~hold, "fold"].value_counts().sort_index().items()
+            for k, v in assignments.loc[assignments.partition.eq("dev"), "fold"]
+            .value_counts()
+            .sort_index()
+            .items()
         },
         "assignments_sha256": _assignments_sha256(assignments),
         "created_at": datetime.now(UTC).isoformat(),
     }
+    for role in ("calibration", "recalibration"):
+        if getattr(cfg, role + "_fraction", 0):
+            manifest["n_" + role] = int(assignments.partition.eq(role).sum())
     if target is not None:
         if len(target) != len(assignments):
             raise ValueError("Target must align with sorted assignments")

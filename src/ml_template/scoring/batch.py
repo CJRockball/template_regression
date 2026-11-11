@@ -145,6 +145,12 @@ def _score_batch(
                     prediction_kind="continuous",
                     prediction_columns=predictor.info["prediction_columns"],
                 )
+            if predictor.info.get("postprocessing") is not None:
+                summary.update(
+                    target_unit=predictor.info["target_unit"],
+                    interval_columns=predictor.info["interval_columns"],
+                    postprocessing=predictor.info["postprocessing"],
+                )
             write_json(directory / "summary.json", summary)
             write_json(
                 directory / "artifacts.json",

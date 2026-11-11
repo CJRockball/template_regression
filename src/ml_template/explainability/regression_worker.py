@@ -87,8 +87,8 @@ def run(request, output, *, check_only):
     info, summary = read_json(release / "release.json"), read_json(score / "summary.json")
     if (
         info.get("task") != "regression"
-        or info.get("release_variant") != "raw"
-        or info.get("calibration_id") is not None
+        or info.get("release_variant") not in {"raw", "recalibrated"}
+        or (info.get("calibration_id") is not None and not info.get("postprocessing"))
         or info["policy"]["kind"] != "none"
         or summary.get("task") != "regression"
         or summary.get("schema_version") != 2
@@ -108,7 +108,19 @@ def run(request, output, *, check_only):
     )
     raw = validate_batch(frame, contract)
     saved = pd.read_parquet(score / "predictions.parquet")
-    required = {key, "y_pred_raw", "y_pred_release", "release_id", "scoring_batch_id"}
+    interval_names = [
+        name
+        for item in info.get("interval_columns", {}).values()
+        for name in (item["lower"], item["upper"])
+    ]
+    required = {
+        key,
+        "y_pred_raw",
+        "y_pred_release",
+        "release_id",
+        "scoring_batch_id",
+        *interval_names,
+    }
     if (
         saved.columns.duplicated().any()
         or set(saved) != required
@@ -124,7 +136,7 @@ def run(request, output, *, check_only):
     for name in ("release_id", "scoring_batch_id"):
         if not saved[name].eq(binding[name]).all():
             raise ValueError("saved prediction identity differs")
-    for name in ("y_pred_raw", "y_pred_release"):
+    for name in ("y_pred_raw", "y_pred_release", *interval_names):
         values = saved[name]
         if (
             not pd.api.types.is_numeric_dtype(values.dtype)
@@ -163,7 +175,7 @@ def run(request, output, *, check_only):
     )
     tolerance = request["tolerance"]
     atol, rtol = tolerance["prediction_atol"], tolerance["prediction_rtol"]
-    for name in ("y_pred_raw", "y_pred_release"):
+    for name in ("y_pred_raw", "y_pred_release", *interval_names):
         if not np.allclose(saved[name], reproduced[name], atol=atol, rtol=rtol):
             raise ValueError("saved continuous prediction parity failed: " + name)
     feature_parts, phi_parts, base_parts, varying = [], [], [], set()
@@ -196,7 +208,14 @@ def run(request, output, *, check_only):
     for name in varying:
         features[name] = "varies across fold transforms"
     phi, bases = np.concatenate(phi_parts), np.concatenate(base_parts)
-    predicted = reproduced.y_pred_raw.to_numpy(float)
+    postprocessing = info.get("postprocessing")
+    if postprocessing is not None:
+        correction = postprocessing["parameters"]["correction"]
+        phi = phi * correction["slope"]
+        bases = bases * correction["slope"] + correction["intercept"]
+    predicted = reproduced[
+        "y_pred_release" if postprocessing is not None else "y_pred_raw"
+    ].to_numpy(float)
     if not np.allclose(bases + phi.sum(axis=1), predicted, atol=atol, rtol=rtol):
         raise ValueError("weighted contributions do not reconstruct released predictor")
     reverify()
@@ -217,6 +236,9 @@ def run(request, output, *, check_only):
         feature_names=names,
         varying_feature_values=sorted(varying),
         predictor_kind=descriptor["kind"],
+        postprocessing=info.get("postprocessing"),
+        interval_columns=info.get("interval_columns", {}),
+        explained_prediction_column="y_pred_release",
         aggregation="saved_member_weights_sum_signed_contributions_and_baselines",
         xgboost_version=xgb.__version__,
         files=file_entries(output, exclude=("request.json", "response.json")),

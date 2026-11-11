@@ -130,8 +130,8 @@ def verify_regression_release(s, directory, run_id, spec, binding):
         or info.get("prediction_kind") != "continuous"
         or info["parent_run_id"] != run_id
         or info["evaluation_id"] != binding["evaluation_id"]
-        or info.get("calibration_id") is not None
-        or info.get("release_variant") != "raw"
+        or info.get("calibration_id") != spec.calibration_id
+        or info.get("release_variant") != spec.release_variant
         or info.get("policy", {}).get("kind") != "none"
         or info.get("predictor_kind") != spec.predictor.kind
     ):
@@ -302,6 +302,7 @@ def run_regression_pipeline(
                 name=f"pipeline_{identity}",
                 evaluation_id=eid,
                 parent_run_id=run_id,
+                calibration_id=evaluation_spec.calibration_id,
                 intended_use=evaluation_spec.intended_use,
                 acknowledge_research_release=True,
                 parity_atol=1e-7,

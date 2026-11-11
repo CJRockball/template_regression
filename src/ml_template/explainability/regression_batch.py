@@ -52,6 +52,8 @@ def inspect(config):
         raise ValueError("explicit registered batch/release paths, task or row limit differ")
     if not config.target_unit or not config.target_unit.strip():
         raise ValueError("explicit regression target_unit required")
+    if batch.summary.get("target_unit") not in (None, config.target_unit):
+        raise ValueError("explanation units differ from frozen units")
     release = verify_release(config.release_dir, config.expected_release_id)
     score = Path(config.scoring_dir)
     entries = file_entries(score, exclude=("artifacts.json",))
@@ -135,7 +137,14 @@ def explain_batch(config, *, check_only=False):
                 or not reproduced.release_id.eq(batch.release_id).all()
             ):
                 raise ValueError("reproduced prediction identity/schema differs")
-            for name in ("y_pred_raw", "y_pred_release"):
+            interval_names = [
+                name
+                for item in batch.summary.get("interval_columns", {}).values()
+                for name in (item["lower"], item["upper"])
+            ]
+            if response.get("postprocessing") != batch.summary.get("postprocessing"):
+                raise ValueError("worker postprocessing differs")
+            for name in ("y_pred_raw", "y_pred_release", *interval_names):
                 if not np.allclose(
                     reproduced[name],
                     expected[name],
@@ -145,13 +154,20 @@ def explain_batch(config, *, check_only=False):
                     raise ValueError("saved prediction parity failed")
             if not np.allclose(
                 result.rows.y_pred_raw,
-                reproduced.y_pred_raw,
+                reproduced[
+                    "y_pred_release" if batch.summary.get("postprocessing") else "y_pred_raw"
+                ],
                 atol=config.prediction_atol,
                 rtol=config.prediction_rtol,
             ):
                 raise ValueError("SHAP prediction differs from released prediction")
         validate_groups(config, list(features))
         rows = result.rows.copy()
+        if batch.summary.get("postprocessing"):
+            rows["y_pred_explained"] = rows.pop("y_pred_raw")
+            rows["y_pred_raw"] = reproduced.y_pred_raw
+            for name in interval_names:
+                rows[name] = reproduced[name]
         rows["y_pred_release"] = reproduced.y_pred_release
         for name, value in (
             ("release_id", batch.release_id),
@@ -182,7 +198,7 @@ def explain_batch(config, *, check_only=False):
             "n_features": len(features.columns),
             "n_flagged": None,
             "parent_run_id": batch.summary["parent_run_id"],
-            "calibration_id": None,
+            "calibration_id": batch.summary.get("calibration_id"),
             "method": result.method,
             "output_scale": result.output_scale,
             "feature_dependence": result.feature_dependence,
@@ -193,6 +209,12 @@ def explain_batch(config, *, check_only=False):
             "population": "complete_original_scoring_batch",
             "created_at": datetime.now(UTC).isoformat(),
         }
+        if batch.summary.get("postprocessing"):
+            summary.update(
+                postprocessing=batch.summary["postprocessing"],
+                interval_columns=batch.summary["interval_columns"],
+                explained_prediction_column="y_pred_explained",
+            )
         write_json(stage / "summary.json", summary)
         write_json(stage / "config.json", config.model_dump())
         write_json(
@@ -227,7 +249,9 @@ def explain_batch(config, *, check_only=False):
             },
         )
         message = (
-            "Contributions reconstruct continuous predictions in declared target units. "
+            "Contributions reconstruct released point predictions in declared target units. "
+            "Affine output correction scales contributions and baseline; its intercept shifts only the baseline. "
+            "Saved interval bounds are not SHAP attributions. "
             "These are estimator-space, tree-path-dependent attributions, not causes or "
             "source-feature redistribution. CV contributions and baselines use saved member "
             "weights. Dependence is disabled where fold transforms produce different values. "

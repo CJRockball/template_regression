@@ -215,6 +215,10 @@ def evaluate(engine, config, *, output_root, check_only=False):
             reference_n=reference["n_rows"],
             sampling=sampling,
         )
+        if batch.task == "regression":
+            from ml_template.evaluation.regression_postprocessing import add_monitoring
+
+            add_monitoring(config, batch, labels, performance, findings)
         if reference["scoring_batch_id"] == batch.batch_id:
             findings.append(
                 {

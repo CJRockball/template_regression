@@ -43,6 +43,14 @@ def load_view(record, summary, manifest, directory, *, max_rows):
         "scoring_batch_id",
         "explanation_id",
     }
+    declared = summary.get("postprocessing")
+    if declared is not None:
+        required.add("y_pred_explained")
+        required.update(
+            name
+            for item in summary["interval_columns"].values()
+            for name in (item["lower"], item["upper"])
+        )
     if not rows.columns.is_unique or set(rows) != required or len(rows) != summary["n_rows"]:
         raise ValueError("unexpected regression explanation row schema")
     keys = rows.index.tolist()
@@ -70,9 +78,35 @@ def load_view(record, summary, manifest, directory, *, max_rows):
         raise ValueError("unverified regression explanation")
     tol = RegressionTolerance(**verification["tolerance"])
     result = build_regression_explanation(
-        features, contributions, rows.base_value, rows.y_pred_raw, tolerance=tol
+        features,
+        contributions,
+        rows.base_value,
+        rows["y_pred_explained"] if declared is not None else rows.y_pred_raw,
+        tolerance=tol,
     )
-    if not np.allclose(
+    if declared is not None:
+        from ml_template.models.regression_postprocessing import apply, interval_columns
+
+        point, bounds = apply(
+            rows.y_pred_raw.to_numpy(float), declared["parameters"], declared["coverages"]
+        )
+        if summary.get("explained_prediction_column") != "y_pred_explained" or summary[
+            "interval_columns"
+        ] != interval_columns(declared["parameters"], declared["coverages"]):
+            raise ValueError("explained output or interval schema differs")
+        for name, expected_values in {
+            "y_pred_release": point,
+            "y_pred_explained": point,
+            **bounds,
+        }.items():
+            if not np.allclose(
+                rows[name].to_numpy(float),
+                expected_values,
+                atol=tol.prediction_atol,
+                rtol=tol.prediction_rtol,
+            ):
+                raise ValueError("postprocessed explanation rows differ")
+    elif not np.allclose(
         rows.y_pred_release.to_numpy(float),
         rows.y_pred_raw.to_numpy(float),
         atol=tol.prediction_atol,
@@ -88,6 +122,8 @@ def load_view(record, summary, manifest, directory, *, max_rows):
         ):
             raise ValueError("stored reconstruction differs")
     provenance = read_json(directory / "provenance.json")
+    if declared is not None and provenance["inference_worker"].get("postprocessing") != declared:
+        raise ValueError("correction differs from inference worker evidence")
     binding = dict(provenance["source_binding"])
     claimed = binding.pop("binding_sha256")
     if (

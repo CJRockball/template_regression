@@ -59,6 +59,29 @@ def load_run_inputs(
 
     split_id = split_id_for(cfg, contract)
     assignments = load_split(split_id, split_root)
+    if cfg.task == "regression" and (
+        cfg.split.calibration_fraction or cfg.split.recalibration_fraction
+    ):
+        import hashlib
+        import json
+
+        from ml_template.training.regression_partitions import validate_assignments
+
+        manifest = json.loads((Path(split_root) / split_id / "manifest.json").read_text())
+        validate_assignments(cfg.split, assignments, manifest)
+        dev = assignments.partition.eq("dev")
+        key = contract.entity_id
+        if (
+            assignments[key].isna().any()
+            or assignments[key].duplicated().any()
+            or len(assignments) != manifest["n_rows"]
+            or int(assignments.partition.eq("holdout").sum()) != manifest["n_holdout"]
+            or not assignments.loc[~dev, "fold"].eq(-1).all()
+            or sorted(assignments.loc[dev, "fold"].unique()) != list(range(cfg.split.n_folds))
+            or hashlib.sha256(assignments.to_csv(index=False).encode()).hexdigest()
+            != manifest["assignments_sha256"]
+        ):
+            raise ValueError("invalid reserved split inventory before fitting")
 
     frame = silver.model_frame()
     raw = frame[silver.features]

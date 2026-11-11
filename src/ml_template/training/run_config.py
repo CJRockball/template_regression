@@ -28,7 +28,14 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ml_template.evaluation.metrics import resolved_keys, with_standard
 from ml_template.models.nn.params import NNModelConfig
@@ -63,6 +70,27 @@ class SplitConfig(_Strict):
     # Controls development-fold assignments only.
     # None preserves the original behavior and split identity.
     cv_seed: int | None = None
+    calibration_fraction: float = Field(default=0.0, ge=0, lt=1, allow_inf_nan=False)
+    recalibration_fraction: float = Field(default=0.0, ge=0, lt=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _reserved_roles(self):
+        if (self.calibration_fraction or self.recalibration_fraction) and (
+            self.method != "random"
+            or self.holdout_fraction + self.calibration_fraction + self.recalibration_fraction >= 1
+        ):
+            raise ValueError(
+                "reserved calibration roles require random splitting and positive development share"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _legacy_serialization(self, handler):
+        data = handler(self)
+        for name in ("calibration_fraction", "recalibration_fraction"):
+            if data.get(name) == 0:
+                data.pop(name, None)
+        return data
 
 
 class TrainingConfig(_Strict):

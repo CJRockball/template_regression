@@ -25,8 +25,8 @@ class RegressionReleasedPredictor:
             or self.info.get("prediction_kind") != "continuous"
         ):
             raise ValueError("Unsupported regression release semantics")
-        if self.info["calibration_id"] is not None or self.info["release_variant"] != "raw":
-            raise ValueError("Regression release must be uncalibrated")
+        if self.info["release_variant"] not in {"raw", "recalibrated"}:
+            raise ValueError("unsupported regression point variant")
         self.policy = PolicyConfig.model_validate(self.info["policy"])
         if self.policy.kind != "none":
             raise ValueError("Classification policy is invalid for regression")
@@ -61,6 +61,8 @@ class RegressionReleasedPredictor:
         if (
             summary["evaluation_id"] != self.info["evaluation_id"]
             or summary["parent_run_id"] != self.info["parent_run_id"]
+            or summary.get("calibration_id") != self.info["calibration_id"]
+            or summary.get("release_variant") != self.info["release_variant"]
         ):
             raise ValueError("Release summary identity differs")
         from ml_template.evaluation.evaluation_inputs import digest
@@ -88,6 +90,9 @@ class RegressionReleasedPredictor:
             provenance,
             feature_info,
         )
+        from ml_template.evaluation.regression_postprocessing import load_packaged
+
+        self.postprocessing = load_packaged(self.directory, self.info, provenance, spec)
         self.model = load_selected_predictor(cfg, self.directory, descriptor)
 
     def _prepare_source_features(self, source):
@@ -110,7 +115,7 @@ class RegressionReleasedPredictor:
             features = self._prepare_source_features(raw.iloc[start : start + chunk_size])
             pieces.append(continuous(self.model.predict(features), len(features)))
         values = continuous(np.concatenate(pieces), len(raw))
-        return pd.DataFrame(
+        result = pd.DataFrame(
             {
                 self.contract["key_col"]: raw.index.to_numpy(),
                 "y_pred_raw": values,
@@ -118,3 +123,6 @@ class RegressionReleasedPredictor:
                 "release_id": self.release_id,
             }
         )
+        from ml_template.evaluation.regression_postprocessing import add_predictions
+
+        return add_predictions(result, self.postprocessing)

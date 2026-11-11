@@ -51,6 +51,7 @@ class MonitorConfig(StrictRequest):
     abs_bias_warning: float | None = Field(default=None, ge=0)
     missing_rate_warning: float = Field(default=1.0, ge=0, le=1)
     missing_rate_delta_warning: float = Field(default=0.1, ge=0, le=1)
+    interval_coverage_slack: float = Field(default=0.05, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_options(self):

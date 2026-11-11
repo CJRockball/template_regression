@@ -24,6 +24,10 @@ def numeric(series, label):
 
 
 def validate_predictions(frame, summary, info):
+    if info.get("postprocessing") is not None:
+        from ml_template.evaluation.regression_postprocessing import validate_saved_predictions
+
+        return validate_saved_predictions(frame, summary, info)
     if (
         info.get("task") != "regression"
         or info.get("prediction_kind") != "continuous"
@@ -75,6 +79,8 @@ def validate_options(batch, config, *, reference=None, labels=None):
         or getattr(config, "recall_floor", None) is not None
     ):
         raise ValueError("probability/recall thresholds are invalid for regression")
+    if getattr(batch, "summary", {}).get("target_unit") not in (None, unit):
+        raise ValueError("request units differ from frozen units")
     if reference is not None and reference.get("target_unit") != unit:
         raise ValueError("reference target unit differs from request")
     if labels is not None and labels["metadata"].get("target_unit") != unit:

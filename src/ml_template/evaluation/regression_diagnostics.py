@@ -118,8 +118,12 @@ def align_oof(oof, X, y, assignments, key_col):
         raise ValueError("Feature/target indices must be aligned unique non-null keys")
     if assignments[key_col].isna().any() or assignments[key_col].duplicated().any():
         raise ValueError("Split keys must be unique and non-null")
-    if not assignments.partition.isin(["dev", "holdout"]).all():
+    allowed_partitions = ["dev", "holdout", "calibration", "recalibration"]
+    if not assignments.partition.isin(allowed_partitions).all():
         raise ValueError("Unknown split partition")
+    non_development = ~assignments.partition.eq("dev")
+    if not assignments.loc[non_development, "fold"].eq(-1).all():
+        raise ValueError("Non-development rows must use fold -1")
     dev = assignments.loc[assignments.partition.eq("dev"), [key_col, "fold"]]
     if dev.empty or dev.fold.isna().any() or (dev.fold < 0).any() or (dev.fold % 1 != 0).any():
         raise ValueError("Invalid development folds")

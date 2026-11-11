@@ -50,6 +50,8 @@ def regression_evidence(engine, request):
         != record["identity_hash"]
     ):
         raise ValueError("Evaluation evidence digest differs")
+    if hasattr(request, "calibration_id") and request.calibration_id != spec.calibration_id:
+        raise ValueError("release request calibration differs from evaluation")
     p = prepare_regression(engine, spec)
     if (
         p.spec != spec
@@ -136,7 +138,10 @@ def check_regression_parity(predictor, material, atol):
     expected_hash = material["reference_sha256"]
     if sha256(path) != expected_hash:
         raise ValueError("Evaluation predictions changed")
-    reference = pd.read_parquet(path, columns=[p.key_col, "y_pred"])
+    from ml_template.evaluation.regression_postprocessing import reference_columns
+
+    extra = reference_columns(material)
+    reference = pd.read_parquet(path, columns=[p.key_col, "y_pred", *extra])
     if (
         reference[p.key_col].isna().any()
         or reference[p.key_col].duplicated().any()
@@ -156,8 +161,13 @@ def check_regression_parity(predictor, material, atol):
         .set_index(p.key_col)
         .sort_index()
     )
-    for column in ["y_pred_raw", "y_pred_release"]:
-        if not np.allclose(values, whole[column], rtol=0, atol=atol) or not np.allclose(
+    for column in [
+        "y_pred_raw",
+        "y_pred_release",
+        *[name for name in extra if name != "y_pred_raw"],
+    ]:
+        expected_values = reference[column].to_numpy(float) if column in reference else values
+        if not np.allclose(expected_values, whole[column], rtol=0, atol=atol) or not np.allclose(
             whole[column], chunked[column], rtol=0, atol=atol
         ):
             raise ValueError(f"Regression prediction parity failed: {column}")
@@ -215,8 +225,8 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
             "created_at": datetime.now(UTC).isoformat(),
             "parent_run_id": request.parent_run_id,
             "evaluation_id": request.evaluation_id,
-            "calibration_id": None,
-            "release_variant": "raw",
+            "calibration_id": spec.calibration_id,
+            "release_variant": spec.release_variant,
             "policy": policy,
             "intended_use": request.intended_use,
             "research_only": True,
@@ -226,6 +236,9 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
             "evaluation_summary": material["summary"],
             "limitations": list(spec.limitations),
         }
+        from ml_template.evaluation.regression_postprocessing import package
+
+        package(stage, material, info)
         write_json(stage / "release.json", info)
         write_json(stage / "contract.json", material["contract"])
         write_json(stage / "feature_recipe.json", material["recipe"])

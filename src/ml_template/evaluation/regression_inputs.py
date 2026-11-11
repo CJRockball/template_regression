@@ -108,7 +108,10 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         raise ValueError("Split manifest ID differs")
     assignments = pd.read_parquet(assignments_path)
     canonical_keys(assignments[key])
-    if not assignments.partition.isin(["dev", "holdout"]).all() or assignments.fold.isna().any():
+    from ml_template.training.regression_partitions import validate_assignments
+
+    validate_assignments(cfg.split, assignments, spm)
+    if assignments.fold.isna().any():
         raise ValueError("Invalid split partitions")
     fold_values = pd.to_numeric(assignments.fold, errors="raise")
     if not np.isfinite(fold_values).all() or (fold_values % 1 != 0).any():
@@ -117,7 +120,11 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     fold_ids = sorted(int(k) for k in assignments.loc[dev, "fold"].unique())
     if fold_ids != list(range(cfg.split.n_folds)) or not assignments.loc[~dev, "fold"].eq(-1).all():
         raise ValueError("Invalid development/holdout folds")
-    hold_keys = assignments.loc[~dev, key].sort_values(kind="stable").tolist()
+    hold_keys = (
+        assignments.loc[assignments.partition.eq("holdout"), key]
+        .sort_values(kind="stable")
+        .tolist()
+    )
     if not hold_keys or len(assignments) != spm["n_rows"] or len(hold_keys) != spm["n_holdout"]:
         raise ValueError("Split row counts differ")
     import hashlib
@@ -182,6 +189,10 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         ],
         "feature_preparation": preparation,
     }
+    if spec.calibration_id is not None:
+        from ml_template.evaluation.regression_postprocessing import attach
+
+        attach(engine, spec, provenance)
     identity = digest({"spec": spec.model_dump(mode="json"), "provenance": provenance})
     return PreparedRegression(
         spec,
