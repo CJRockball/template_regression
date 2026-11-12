@@ -235,6 +235,11 @@ def external_metadata(ctx, directory):
     for alias, name in [("config", "config.json"), ("features", "features.json")]:
         if bound.get(alias) != ctx["entries"][name]["sha256"]:
             raise ValueError("Analysis belongs to a different run snapshot")
+    if provenance.get("analysis_kind") is not None:
+        from ml_template.evaluation.residual_artifacts import verify_external
+
+        verify_external(ctx, directory, entries, provenance, state)
+        return entries
     descriptor = provenance["fold_descriptor"]
     count = ctx["config"]["split"]["n_folds"]
     members = descriptor.get("members", [])
