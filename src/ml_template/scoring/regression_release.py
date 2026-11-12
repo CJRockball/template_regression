@@ -20,6 +20,10 @@ from ml_template.scoring.release_artifacts import (
 
 
 def regression_evidence(engine, request):
+    from ml_template.scoring.nn_release import evidence, is_nn_parent
+
+    if is_nn_parent(engine, request.parent_run_id):
+        return evidence(engine, request)
     from ml_template.db.evaluation_registry import get_evaluation
     from ml_template.evaluation.evaluation_inputs import digest
     from ml_template.evaluation.regression_config import RegressionEvaluationConfig
@@ -70,6 +74,7 @@ def prepare_regression_release(engine, request):
     from ml_template.features.feature_set_store import resolve_feature_set
     from ml_template.features.prepared_recipe import prepare_frame, verify_prepared
     from ml_template.scoring.input_contract import coerce_frame, validate_batch
+    from ml_template.scoring.nn_release import neural_config
     from ml_template.scoring.pre_gold_schema import build_pre_gold_contract
     from ml_template.scoring.source_spec import freeze_source_spec
 
@@ -116,6 +121,8 @@ def prepare_regression_release(engine, request):
         source_policy=source_policy,
         model_policy=model_policy,
     )
+    if neural_config(getattr(p, "run_cfg", None)):
+        contract["estimator_validation"] = "saved_nn_adapter_finite_arrays"
     validate_batch(source.reset_index(), contract, enforce_rates=True)
     return {
         "prepared": p,
@@ -133,6 +140,10 @@ def prepare_regression_release(engine, request):
 
 
 def check_regression_parity(predictor, material, atol):
+    from ml_template.scoring.nn_release import check_parity, neural_config
+
+    if neural_config(getattr(material["prepared"], "run_cfg", None)):
+        return check_parity(predictor, material, atol)
     p = material["prepared"]
     path = material["evaluation_dir"] / "holdout_predictions.parquet"
     expected_hash = material["reference_sha256"]
@@ -189,9 +200,16 @@ def check_regression_parity(predictor, material, atol):
 
 
 def build_regression_release(engine, request, *, check_only=False, output_root=None):
+    from ml_template.scoring.nn_release import neural_config
+
     material = prepare_regression_release(engine, request)
     p, spec = (material["prepared"], material["spec"])
     if check_only:
+        if neural_config(getattr(p, "run_cfg", None)):
+            from ml_template.paths import ARTIFACTS
+            from ml_template.scoring.nn_release import validate_destination
+
+            validate_destination(p, output_root or ARTIFACTS / "releases")
         return {
             "ready": True,
             "task": "regression",
@@ -201,12 +219,27 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
             "holdout_labels_loaded": False,
             "parity_executed": False,
             "files_written": False,
+            **(
+                {
+                    "model_type": "nn",
+                    "models_loaded": False,
+                    "predictions_computed": False,
+                    "source_features_loaded": True,
+                    "labels_loaded": False,
+                }
+                if neural_config(getattr(p, "run_cfg", None))
+                else {}
+            ),
         }
     from ml_template.db.scoring_registry import register_release
     from ml_template.paths import ARTIFACTS
     from ml_template.scoring.predictor import ReleasedPredictor
 
     root = Path(output_root or ARTIFACTS / "releases").resolve()
+    if neural_config(getattr(p, "run_cfg", None)):
+        from ml_template.scoring.nn_release import validate_destination
+
+        validate_destination(p, root)
     root.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".regression-release-", dir=root))
     try:
@@ -236,6 +269,8 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
             "evaluation_summary": material["summary"],
             "limitations": list(spec.limitations),
         }
+        if neural_config(getattr(p, "run_cfg", None)):
+            info.update(model_type="nn", target_unit=spec.target_unit)
         from ml_template.evaluation.regression_postprocessing import package
 
         package(stage, material, info)
@@ -253,7 +288,7 @@ def build_regression_release(engine, request, *, check_only=False, output_root=N
                 "evaluation_summary": material["summary"],
             },
         )
-        for name in ["config.json", "features.json", *descriptor["files_sha256"]]:
+        for name in dict.fromkeys(["config.json", "features.json", *descriptor["files_sha256"]]):
             dest = inside(stage, name)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p.run_dir / name, dest)

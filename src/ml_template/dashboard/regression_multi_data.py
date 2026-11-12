@@ -511,6 +511,33 @@ def population_fingerprint(silver_id, key, values):
     return digest({"silver": silver_id, "key": key, "members": sorted(encoded)})
 
 
+def _load_nn_evaluation(engine, record, directory, predictions):
+    from ml_template.tracking.nn_evaluation_contract import (
+        read_document,
+        validate_predictions,
+        validate_report,
+    )
+
+    data = read_document(directory)
+    stored = base.rows(
+        engine,
+        "SELECT result_json FROM final_evaluation_metrics WHERE evaluation_id=?",
+        (record["evaluation_id"],),
+    )
+    validate_report(data, record, [json.loads(row["result_json"]) for row in stored])
+    frame = None
+    if predictions:
+        frame = pd.read_parquet(base.safe(directory, "holdout_predictions.parquet"))
+        validate_predictions(frame, data)
+    return {
+        "state": "verified",
+        "record": record,
+        "data": data,
+        "predictions": frame,
+        "message": "Frozen NN evidence verified against saved sidecars/registry. No evaluator, model or source dataset was used. Labelled predictions require explicit opt-in.",
+    }
+
+
 def load_regression_evaluation(engine, evaluation_id, predictions=False):
     """Read already registered evidence; never invoke evaluation or mark access."""
     if not evaluation_id:
@@ -574,6 +601,8 @@ def load_regression_evaluation(engine, evaluation_id, predictions=False):
             or record.get("holdout_fingerprint") != provenance["holdout_fingerprint"]
         ):
             raise ValueError("Frozen evaluation dataset/population differs")
+        if provenance.get("predictor", {}).get("schema_version") == 3:
+            return _load_nn_evaluation(engine, record, directory, predictions)
         if (
             record.get("calibration_id") is not None
             or spec.get("calibration_id") is not None

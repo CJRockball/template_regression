@@ -1,0 +1,11 @@
+# Replace with the actual successful Package 03 ID; never create a new evaluation to debug packaging.
+schema_version: 2
+task: regression
+name: concrete_nn_research
+parent_run_id: run_20261111_135508_ccf0e8
+evaluation_id: eval_20261112_073325_ecdc4a43
+# Must exactly match the evaluation: null for uncalibrated; actual regcal_... otherwise.
+calibration_id: null
+intended_use: "Exploratory NN research release; not independent deployment approval"
+acknowledge_research_release: true
+parity_atol: 0.00001

@@ -30,9 +30,33 @@ class PreparedRegression:
     identity_hash: str
     fingerprint: str
     roots: dict
+    purpose: str = "evaluation"
 
 
 def prepare_regression(engine, spec, *, silver_root=None, split_root=None, feature_root=None):
+    """Existing evaluation/calibration/release boundary remains XGB-only in Package 01."""
+    return _prepare_regression_inputs(
+        engine, spec, silver_root=silver_root, split_root=split_root, feature_root=feature_root
+    )
+
+
+def prepare_nn_regression_predictor_inputs(
+    engine, spec, *, silver_root=None, split_root=None, feature_root=None
+):
+    """NN metadata/predictor preparation only; no label loading or lifecycle authorisation."""
+    return _prepare_regression_inputs(
+        engine,
+        spec,
+        silver_root=silver_root,
+        split_root=split_root,
+        feature_root=feature_root,
+        nn_predictor_only=True,
+    )
+
+
+def _prepare_regression_inputs(
+    engine, spec, *, silver_root=None, split_root=None, feature_root=None, nn_predictor_only=False
+):
     from ml_template.data.contract import load_dataset_contract
     from ml_template.db import model_run_registry as registry
     from ml_template.models.predictor_selection import describe_predictor
@@ -41,14 +65,38 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
     from ml_template.training.run_config import RunConfig, config_hash, resolve_path
     from ml_template.training.split import compute_split_id
 
-    parent = registry.get_run(engine, spec.parent_run_id)
+    if nn_predictor_only:
+        # No ensure_tables/schema migrations in a read-only NN preparation.
+        from sqlalchemy import text
+
+        with engine.connect() as connection:
+            row = (
+                connection.execute(
+                    text("SELECT * FROM model_runs WHERE run_id=:run_id"),
+                    {"run_id": spec.parent_run_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+        parent = dict(row) if row is not None else None
+    else:
+        parent = registry.get_run(engine, spec.parent_run_id)
     if not parent or parent["status"] != "succeeded":
         raise ValueError("Parent run must exist and have succeeded")
     run_dir = artifacts.resolve_stored_path(parent["artifact_dir"])
     for name in ["config.json", "features.json", "model.ubj", "oof_predictions.parquet"]:
         artifacts.verify_artifact(run_dir, name)
     cfg = RunConfig.model_validate_json((run_dir / "config.json").read_text())
-    if cfg.task != "regression" or cfg.model.type != "xgb":
+    if nn_predictor_only:
+        if cfg.task != "regression" or cfg.model.type != "nn" or cfg.fitted_features:
+            raise ValueError("Expected NN regression parent with embedded preprocessing")
+        if (
+            spec.calibration_id is not None
+            or spec.release_variant != "raw"
+            or spec.uncertainty.enabled
+        ):
+            raise ValueError("Package 01 supports raw NN predictor preparation only")
+    elif cfg.task != "regression" or cfg.model.type != "xgb":
         raise ValueError("Expected XGB regression parent")
     from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
 
@@ -146,12 +194,24 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
             raise ValueError(f"Unexpected {field}")
         resolved[field] = actual
     spec = type(spec).model_validate(resolved)
+    nn_options = {}
+    if nn_predictor_only:
+        n_dev = int(dev.sum())
+        if spec.predictor.kind == "final":
+            counts = {"model.ubj": n_dev}
+        else:
+            counts = {
+                f"fold_models/fold_{k}.ubj": int((dev & assignments.fold.ne(k)).sum())
+                for k in fold_ids
+            }
+        nn_options["training_rows"] = counts
     descriptor = describe_predictor(
         cfg,
         run_dir,
         spec.predictor.kind,
         fold_ids=fold_ids,
         verify_artifact=artifacts.verify_artifact,
+        **nn_options,
     )
     from ml_template.features.prepared_recipe import verify_plan
 
@@ -175,6 +235,11 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
             versions[name] = version(name)
         except PackageNotFoundError:
             versions[name] = "not-installed"
+    if nn_predictor_only:
+        try:
+            versions["torch"] = version("torch")
+        except PackageNotFoundError:
+            versions["torch"] = "not-installed"
     fingerprint = holdout_fingerprint(cfg.data.silver_dataset_version_id, key, hold_keys)
     provenance = {
         "task": "regression",
@@ -209,6 +274,7 @@ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, featu
         identity,
         fingerprint,
         roots,
+        purpose="predictor_only" if nn_predictor_only else "evaluation",
     )
 
 
@@ -216,5 +282,7 @@ def load_holdout(prepared):
     """Load only the already-approved holdout after access is recorded."""
     from ml_template.features.prepared_recipe import load_partition
 
+    if getattr(prepared, "purpose", "evaluation") != "evaluation":
+        raise ValueError("Predictor-only preparation does not authorise holdout loading")
     X, y = load_partition(prepared, prepared.hold_keys)
     return X, y.to_numpy(dtype=float)

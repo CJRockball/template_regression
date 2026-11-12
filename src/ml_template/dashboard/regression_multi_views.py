@@ -450,7 +450,14 @@ def evaluation_view(engine, evaluation_id):
             html.P(loaded["message"]),
             html.P("Recorded access: " + singapore(loaded["record"].get("accessed_at"))),
             html.P(
-                "Metrics are frozen point estimates; no new metrics or intervals are calculated. Prior exposure is the state recorded at evaluation time, not a claim of current untouched data. Units were not frozen by this evaluator: shown in native target units."
+                "Frozen metrics only; no evaluation is run here. Prior exposure is recorded history, not a claim of untouched data. "
+                + (
+                    "Frozen target unit: "
+                    + str(document["summary"]["target_unit"])
+                    + ". R2 is dimensionless; prediction intervals are not metric confidence intervals."
+                    if document["summary"].get("model_type") == "nn"
+                    else "Units were not frozen by this evaluator: shown in native target units."
+                )
             ),
             table(pd.DataFrame([document["summary"]])),
             html.H4("Saved holdout metrics"),
@@ -497,7 +504,8 @@ def register_evaluation(app, engine):
                 "Saved labelled predictions have not been read. Enable explicitly to display them; source datasets/models are never opened."
             )
         frame = loaded["predictions"].rename(columns={"y_pred": "y_pred_oof"})
-        charts = figures.residual_figures(frame, "native target units")
+        unit = loaded["data"]["summary"].get("target_unit") or "native target units"
+        charts = figures.residual_figures(frame, unit)
         for fig in charts:
             if fig.layout.title.text:
                 fig.update_layout(title=fig.layout.title.text.replace("OOF", "saved holdout"))

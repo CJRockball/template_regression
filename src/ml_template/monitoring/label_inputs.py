@@ -64,6 +64,9 @@ def validate_labels(frame, batch):
 
 def import_labels(engine, config, *, output_root, check_only=False):
     batch = load_batch(engine, config.scoring_batch_id)
+    from ml_template.monitoring.nn_monitoring_contract import context_for
+
+    nn_context = context_for(batch, config)
     from ml_template.monitoring.regression import validate_options
 
     validate_options(batch, config)
@@ -107,6 +110,7 @@ def import_labels(engine, config, *, output_root, check_only=False):
         "release_id": batch.release_id,
         "source_sha256": before,
         "scoring_hashes": batch.artifact_hashes,
+        **({"nn_context": nn_context} if nn_context is not None else {}),
     }
     write_json(directory / "labels.json", metadata)
     manifest_hash = seal(directory)
@@ -144,5 +148,8 @@ def load_labels(engine, identity, batch):
         or metadata["scoring_hashes"] != batch.artifact_hashes
     ):
         raise ValueError("label import prediction provenance mismatch")
+    from ml_template.monitoring.nn_monitoring_contract import validate_saved_context
+
+    validate_saved_context(metadata, batch, same_batch=True)
     frame = validate_labels(pd.read_parquet(directory / "labels.parquet"), batch)
     return {"metadata": metadata, "frame": frame}

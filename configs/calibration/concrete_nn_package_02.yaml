@@ -1,0 +1,15 @@
+# Package 02 only: freeze one NN postprocessing request BEFORE reserved-label access.
+# This is not an evaluation, release or parameter sweep.
+model_type: nn
+parent_run_id: run_20261111_135508_ccf0e8
+predictor_kind: final
+correction: none
+coverages: [0.8, 0.9, 0.95]
+target_unit: MPa
+min_calibration_rows: 30
+min_recalibration_rows: 10
+intended_use: "Exploratory NN regression interval calibration; no deployment approval"
+# Concrete has prior exposure: --check should report ready:false if history is present.
+# Deliberately not pre-authorised. Acknowledgement cannot restore independence.
+acknowledge_prior_exposure: false
+prior_exposure_note: ""

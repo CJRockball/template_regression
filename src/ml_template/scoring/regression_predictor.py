@@ -93,6 +93,9 @@ class RegressionReleasedPredictor:
         from ml_template.evaluation.regression_postprocessing import load_packaged
 
         self.postprocessing = load_packaged(self.directory, self.info, provenance, spec)
+        from ml_template.scoring.nn_release import validate_packaged_nn
+
+        validate_packaged_nn(cfg, self.info, self.contract, descriptor, evidence)
         self.model = load_selected_predictor(cfg, self.directory, descriptor)
 
     def _prepare_source_features(self, source):

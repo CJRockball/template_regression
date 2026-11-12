@@ -165,6 +165,12 @@ def test_part2_ui_is_read_only(tmp_path):
     app.layout = lambda: monitoring_layout(database)
     register_monitoring_callbacks(app, database)
     assert app.server.test_client().get("/_dash-layout").status_code == 200
-    assert len(app.callback_map) == 1
+    assert len(app.callback_map) == 2
+    export = app.callback_map["mon-report-download.data"]
+    assert export["inputs"] == [{"id": "mon-report-export", "property": "n_clicks"}]
+    assert export["state"] == [{"id": "mon-selection", "property": "value"}]
+    dependencies = app.server.test_client().get("/_dash-dependencies").get_json()
+    download = next(row for row in dependencies if row["output"] == "mon-report-download.data")
+    assert download["prevent_initial_call"] is True
     with sqlite3.connect(database) as conn:
         assert conn.execute("SELECT name FROM sqlite_master").fetchall() == []
