@@ -1,0 +1,22 @@
+{
+  "scripts/nn_acceptance_progress.py": {
+    "before": null,
+    "after": "dd59a183af14ed6cbf0a08ad6ed257dc7fa6f9035e0ecfd0117288f6a53fd7fe"
+  },
+  "scripts/nn_acceptance_live.py": {
+    "before": null,
+    "after": "bc8f1a9ebb00dc864f92a60aa91ea13300b8d19519d15716c89b15ea85e09f6e"
+  },
+  "tests/runtime/test_nn_lifecycle_08_acceptance.py": {
+    "before": null,
+    "after": "6365664bd01c14ab9c5fc0389a9a768ad4e227a6094bc51d16b863011214e1c3"
+  },
+  "docs/nn_lifecycle_package_08.md": {
+    "before": null,
+    "after": "bb82f7cb8ac4d04d164f83da1830d1c2108347b202af4dc8e57a3db21ddf3bc4"
+  },
+  ".github/workflows/nn-lifecycle-acceptance.yml": {
+    "before": "c33b52c053b177ab15d42b32d91a40c468c4003114bf0928fdf963d80b009538",
+    "after": "fa737a140255ed6be7064aee0848e863aa26e1d10b1dd3e6658d5690b127d8bb"
+  }
+}
