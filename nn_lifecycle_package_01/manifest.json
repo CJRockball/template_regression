@@ -1,0 +1,78 @@
+{
+  "base_commit": "063519f55522852957273dd6c0d691420411e8aa",
+  "package": "nn_lifecycle_01",
+  "edits": {
+    "src/ml_template/models/predictor_selection.py": {
+      "git_blob": "35eb1840077d09ec8f70359aeb2c4e20f63978fd",
+      "changes": [
+        {
+          "old": "def required_predictor_files(descriptor):\n    if descriptor.get(\"schema_version\") == 2:\n",
+          "new": "def required_predictor_files(descriptor):\n    if descriptor.get(\"schema_version\") == 3:\n        from ml_template.models.nn_regression_predictor import validate_descriptor\n\n        return validate_descriptor(descriptor, _legacy_required_predictor_files)\n    if descriptor.get(\"schema_version\") == 2:\n"
+        },
+        {
+          "old": "def describe_predictor(cfg, run_dir, kind=\"final\", *, fold_ids=None, verify_artifact=None):\n    if getattr(cfg, \"task\", \"binary_classification\") == \"regression\":\n",
+          "new": "def describe_predictor(cfg, run_dir, kind=\"final\", *, fold_ids=None, verify_artifact=None,\n                       training_rows=None):\n    if getattr(cfg, \"task\", None) == \"regression\" and cfg.model.type == \"nn\":\n        from ml_template.models.nn_regression_predictor import describe\n\n        return describe(cfg, run_dir, kind, fold_ids=fold_ids,\n                        verify_artifact=verify_artifact, training_rows=training_rows)\n    if getattr(cfg, \"task\", \"binary_classification\") == \"regression\":\n"
+        },
+        {
+          "old": "def _validate_against_config(cfg, descriptor):\n    regression = getattr(cfg, \"task\", \"binary_classification\") == \"regression\"\n",
+          "new": "def _validate_against_config(cfg, descriptor):\n    neural = getattr(cfg, \"task\", None) == \"regression\" and cfg.model.type == \"nn\"\n    if neural or descriptor.get(\"schema_version\") == 3:\n        from ml_template.models.nn_regression_predictor import validate_config\n\n        return validate_config(cfg, descriptor)\n    regression = getattr(cfg, \"task\", \"binary_classification\") == \"regression\"\n"
+        },
+        {
+          "old": "def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):\n    if getattr(cfg, \"task\", \"binary_classification\") == \"regression\":\n",
+          "new": "def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):\n    if getattr(cfg, \"task\", None) == \"regression\" and cfg.model.type == \"nn\":\n        from ml_template.models.nn_regression_predictor import load\n\n        return load(cfg, root, descriptor, adapter_loader=adapter_loader)\n    if getattr(cfg, \"task\", \"binary_classification\") == \"regression\":\n"
+        }
+      ]
+    },
+    "src/ml_template/evaluation/regression_inputs.py": {
+      "git_blob": "e9202af9a2cfa5ee9727a4098b0040a5ee49073b",
+      "changes": [
+        {
+          "old": "    roots: dict\n\n\ndef prepare_regression(engine, spec, *, silver_root=None, split_root=None, feature_root=None):\n",
+          "new": "    roots: dict\n    purpose: str = \"evaluation\"\n\n\ndef prepare_regression(engine, spec, *, silver_root=None, split_root=None, feature_root=None):\n    \"\"\"Existing evaluation/calibration/release boundary remains XGB-only in Package 01.\"\"\"\n    return _prepare_regression_inputs(engine, spec, silver_root=silver_root,\n                                     split_root=split_root, feature_root=feature_root)\n\n\ndef prepare_nn_regression_predictor_inputs(engine, spec, *, silver_root=None,\n                                           split_root=None, feature_root=None):\n    \"\"\"NN metadata/predictor preparation only; no label loading or lifecycle authorisation.\"\"\"\n    return _prepare_regression_inputs(engine, spec, silver_root=silver_root,\n                                     split_root=split_root, feature_root=feature_root,\n                                     nn_predictor_only=True)\n\n\ndef _prepare_regression_inputs(engine, spec, *, silver_root=None, split_root=None,\n                               feature_root=None, nn_predictor_only=False):\n"
+        },
+        {
+          "old": "    if cfg.task != \"regression\" or cfg.model.type != \"xgb\":\n        raise ValueError(\"Expected XGB regression parent\")\n",
+          "new": "    if nn_predictor_only:\n        if cfg.task != \"regression\" or cfg.model.type != \"nn\" or cfg.fitted_features:\n            raise ValueError(\"Expected NN regression parent with embedded preprocessing\")\n        if spec.calibration_id is not None or spec.release_variant != \"raw\" or spec.uncertainty.enabled:\n            raise ValueError(\"Package 01 supports raw NN predictor preparation only\")\n    elif cfg.task != \"regression\" or cfg.model.type != \"xgb\":\n        raise ValueError(\"Expected XGB regression parent\")\n"
+        },
+        {
+          "old": "    descriptor = describe_predictor(\n        cfg,\n",
+          "new": "    nn_options = {}\n    if nn_predictor_only:\n        n_dev = int(dev.sum())\n        if spec.predictor.kind == \"final\":\n            counts = {\"model.ubj\": n_dev}\n        else:\n            counts = {f\"fold_models/fold_{k}.ubj\": int((dev & assignments.fold.ne(k)).sum())\n                      for k in fold_ids}\n        nn_options[\"training_rows\"] = counts\n    descriptor = describe_predictor(\n        cfg,\n"
+        },
+        {
+          "old": "        verify_artifact=artifacts.verify_artifact,\n    )\n",
+          "new": "        verify_artifact=artifacts.verify_artifact,\n        **nn_options,\n    )\n"
+        },
+        {
+          "old": "    fingerprint = holdout_fingerprint(cfg.data.silver_dataset_version_id, key, hold_keys)\n",
+          "new": "    if nn_predictor_only:\n        try:\n            versions[\"torch\"] = version(\"torch\")\n        except PackageNotFoundError:\n            versions[\"torch\"] = \"not-installed\"\n    fingerprint = holdout_fingerprint(cfg.data.silver_dataset_version_id, key, hold_keys)\n"
+        },
+        {
+          "old": "        fingerprint,\n        roots,\n    )\n",
+          "new": "        fingerprint,\n        roots,\n        purpose=\"predictor_only\" if nn_predictor_only else \"evaluation\",\n    )\n"
+        },
+        {
+          "old": "    X, y = load_partition(prepared, prepared.hold_keys)\n",
+          "new": "    if getattr(prepared, \"purpose\", \"evaluation\") != \"evaluation\":\n        raise ValueError(\"Predictor-only preparation does not authorise holdout loading\")\n    X, y = load_partition(prepared, prepared.hold_keys)\n"
+        },
+        {
+          "old": "    parent = registry.get_run(engine, spec.parent_run_id)\n",
+          "new": "    if nn_predictor_only:\n        # No ensure_tables/schema migrations in a read-only NN preparation.\n        from sqlalchemy import text\n        with engine.connect() as connection:\n            row = connection.execute(text(\"SELECT * FROM model_runs WHERE run_id=:run_id\"),\n                                     {\"run_id\": spec.parent_run_id}).mappings().one_or_none()\n        parent = dict(row) if row is not None else None\n    else:\n        parent = registry.get_run(engine, spec.parent_run_id)\n"
+        }
+      ]
+    }
+  },
+  "dependencies": {
+    "src/ml_template/models/nn_regressor.py": "7e9a9fe79b9f7395d802e6beaf8defd97098e403",
+    "src/ml_template/preprocessing/nn_preprocessor.py": "2a75e95a0148b9c4118b566738b8683e8bc776a2",
+    "src/ml_template/models/nn/data.py": "f6a289deb14e48640e34b088d0f4583e08e9bef0",
+    "src/ml_template/models/model_factory.py": "5d50acfd4eaeae5253bf717167a47ca8447d0933",
+    "src/ml_template/models/regression_predictor.py": "b1e865473a3cafc9ea35f2be255b41ef857f2e59"
+  },
+  "new_files": {
+    "src/ml_template/models/nn_regression_predictor.py": "86e7e30b4992e1a0d38f400d9d26da42167f68c11d5b526ed57806cb11c671e4",
+    "src/ml_template/evaluation/nn_predictor_preflight.py": "991c7c444d657d940bd967c87ea49d6c56640beaaca403ce936b9ff9d3db4ef1",
+    "tests/models/test_nn_lifecycle_01.py": "6a2ada117bf12721d029ae68d46a16ca49e3ee5b6818e21bea44ba62d461b538",
+    "tests/models/test_nn_lifecycle_01_native.py": "9d85fe9bcea3ade977b0d346715e54f7b0d87cc724fdb786f05133ba3324f2bf",
+    "configs/predictor/concrete_nn_package_01.yaml": "3f81ae13bfe89be897070890fce0581bce5bf5b51409cb1a9f85a41a4fe5882b"
+  }
+}

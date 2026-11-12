@@ -1,0 +1,796 @@
+diff --git a/src/ml_template/models/predictor_selection.py b/src/ml_template/models/predictor_selection.py
+--- a/src/ml_template/models/predictor_selection.py
++++ b/src/ml_template/models/predictor_selection.py
+@@ -79,6 +79,10 @@
+ 
+ 
+ def required_predictor_files(descriptor):
++    if descriptor.get("schema_version") == 3:
++        from ml_template.models.nn_regression_predictor import validate_descriptor
++
++        return validate_descriptor(descriptor, _legacy_required_predictor_files)
+     if descriptor.get("schema_version") == 2:
+         from ml_template.models.regression_predictor import validate_descriptor
+ 
+@@ -88,7 +92,13 @@
+     return _legacy_required_predictor_files(descriptor)
+ 
+ 
+-def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None):
++def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None,
++                       training_rows=None):
++    if getattr(cfg, "task", None) == "regression" and cfg.model.type == "nn":
++        from ml_template.models.nn_regression_predictor import describe
++
++        return describe(cfg, run_dir, kind, fold_ids=fold_ids,
++                        verify_artifact=verify_artifact, training_rows=training_rows)
+     if getattr(cfg, "task", "binary_classification") == "regression":
+         from ml_template.models.regression_predictor import describe
+ 
+@@ -99,6 +109,11 @@
+ 
+ 
+ def _validate_against_config(cfg, descriptor):
++    neural = getattr(cfg, "task", None) == "regression" and cfg.model.type == "nn"
++    if neural or descriptor.get("schema_version") == 3:
++        from ml_template.models.nn_regression_predictor import validate_config
++
++        return validate_config(cfg, descriptor)
+     regression = getattr(cfg, "task", "binary_classification") == "regression"
+     if regression != (descriptor.get("schema_version") == 2):
+         raise ValueError("Predictor task/schema disagrees with run configuration")
+@@ -106,6 +121,10 @@
+ 
+ 
+ def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):
++    if getattr(cfg, "task", None) == "regression" and cfg.model.type == "nn":
++        from ml_template.models.nn_regression_predictor import load
++
++        return load(cfg, root, descriptor, adapter_loader=adapter_loader)
+     if getattr(cfg, "task", "binary_classification") == "regression":
+         from ml_template.models.regression_predictor import load
+ 
+diff --git a/src/ml_template/evaluation/regression_inputs.py b/src/ml_template/evaluation/regression_inputs.py
+--- a/src/ml_template/evaluation/regression_inputs.py
++++ b/src/ml_template/evaluation/regression_inputs.py
+@@ -30,9 +30,25 @@
+     identity_hash: str
+     fingerprint: str
+     roots: dict
++    purpose: str = "evaluation"
+ 
+ 
+ def prepare_regression(engine, spec, *, silver_root=None, split_root=None, feature_root=None):
++    """Existing evaluation/calibration/release boundary remains XGB-only in Package 01."""
++    return _prepare_regression_inputs(engine, spec, silver_root=silver_root,
++                                     split_root=split_root, feature_root=feature_root)
++
++
++def prepare_nn_regression_predictor_inputs(engine, spec, *, silver_root=None,
++                                           split_root=None, feature_root=None):
++    """NN metadata/predictor preparation only; no label loading or lifecycle authorisation."""
++    return _prepare_regression_inputs(engine, spec, silver_root=silver_root,
++                                     split_root=split_root, feature_root=feature_root,
++                                     nn_predictor_only=True)
++
++
++def _prepare_regression_inputs(engine, spec, *, silver_root=None, split_root=None,
++                               feature_root=None, nn_predictor_only=False):
+     from ml_template.data.contract import load_dataset_contract
+     from ml_template.db import model_run_registry as registry
+     from ml_template.models.predictor_selection import describe_predictor
+@@ -41,14 +57,27 @@
+     from ml_template.training.run_config import RunConfig, config_hash, resolve_path
+     from ml_template.training.split import compute_split_id
+ 
+-    parent = registry.get_run(engine, spec.parent_run_id)
++    if nn_predictor_only:
++        # No ensure_tables/schema migrations in a read-only NN preparation.
++        from sqlalchemy import text
++        with engine.connect() as connection:
++            row = connection.execute(text("SELECT * FROM model_runs WHERE run_id=:run_id"),
++                                     {"run_id": spec.parent_run_id}).mappings().one_or_none()
++        parent = dict(row) if row is not None else None
++    else:
++        parent = registry.get_run(engine, spec.parent_run_id)
+     if not parent or parent["status"] != "succeeded":
+         raise ValueError("Parent run must exist and have succeeded")
+     run_dir = artifacts.resolve_stored_path(parent["artifact_dir"])
+     for name in ["config.json", "features.json", "model.ubj", "oof_predictions.parquet"]:
+         artifacts.verify_artifact(run_dir, name)
+     cfg = RunConfig.model_validate_json((run_dir / "config.json").read_text())
+-    if cfg.task != "regression" or cfg.model.type != "xgb":
++    if nn_predictor_only:
++        if cfg.task != "regression" or cfg.model.type != "nn" or cfg.fitted_features:
++            raise ValueError("Expected NN regression parent with embedded preprocessing")
++        if spec.calibration_id is not None or spec.release_variant != "raw" or spec.uncertainty.enabled:
++            raise ValueError("Package 01 supports raw NN predictor preparation only")
++    elif cfg.task != "regression" or cfg.model.type != "xgb":
+         raise ValueError("Expected XGB regression parent")
+     from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+ 
+@@ -146,12 +175,22 @@
+             raise ValueError(f"Unexpected {field}")
+         resolved[field] = actual
+     spec = type(spec).model_validate(resolved)
++    nn_options = {}
++    if nn_predictor_only:
++        n_dev = int(dev.sum())
++        if spec.predictor.kind == "final":
++            counts = {"model.ubj": n_dev}
++        else:
++            counts = {f"fold_models/fold_{k}.ubj": int((dev & assignments.fold.ne(k)).sum())
++                      for k in fold_ids}
++        nn_options["training_rows"] = counts
+     descriptor = describe_predictor(
+         cfg,
+         run_dir,
+         spec.predictor.kind,
+         fold_ids=fold_ids,
+         verify_artifact=artifacts.verify_artifact,
++        **nn_options,
+     )
+     from ml_template.features.prepared_recipe import verify_plan
+ 
+@@ -175,6 +214,11 @@
+             versions[name] = version(name)
+         except PackageNotFoundError:
+             versions[name] = "not-installed"
++    if nn_predictor_only:
++        try:
++            versions["torch"] = version("torch")
++        except PackageNotFoundError:
++            versions["torch"] = "not-installed"
+     fingerprint = holdout_fingerprint(cfg.data.silver_dataset_version_id, key, hold_keys)
+     provenance = {
+         "task": "regression",
+@@ -209,6 +253,7 @@
+         identity,
+         fingerprint,
+         roots,
++        purpose="predictor_only" if nn_predictor_only else "evaluation",
+     )
+ 
+ 
+@@ -216,5 +261,7 @@
+     """Load only the already-approved holdout after access is recorded."""
+     from ml_template.features.prepared_recipe import load_partition
+ 
++    if getattr(prepared, "purpose", "evaluation") != "evaluation":
++        raise ValueError("Predictor-only preparation does not authorise holdout loading")
+     X, y = load_partition(prepared, prepared.hold_keys)
+     return X, y.to_numpy(dtype=float)
+diff --git a/src/ml_template/models/nn_regression_predictor.py b/src/ml_template/models/nn_regression_predictor.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/models/nn_regression_predictor.py
+@@ -0,0 +1,178 @@
++"""Verified NN continuous predictors; no training or source-label access."""
++import copy
++import json
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++
++SERIALIZATION = {"format": "torch", "weights_only": True, "checkpoint_version": 1,
++                 "preprocessing": "embedded"}
++
++
++def validate_descriptor(descriptor, legacy_validator):
++    fields = {"schema_version", "task", "prediction_kind", "model_type", "serialization",
++              "kind", "weighting", "fitted_features", "members", "files_sha256", "training_rows"}
++    if (not isinstance(descriptor, dict) or set(descriptor) != fields
++            or type(descriptor["schema_version"]) is not int or descriptor["schema_version"] != 3
++            or descriptor["task"] != "regression" or descriptor["prediction_kind"] != "continuous"
++            or descriptor["model_type"] != "nn" or descriptor["fitted_features"] is not False
++            or not isinstance(descriptor["files_sha256"], dict)
++            or descriptor["serialization"] != SERIALIZATION
++            or type(descriptor["serialization"].get("checkpoint_version")) is not int
++            or descriptor["serialization"].get("weights_only") is not True):
++        raise ValueError("Invalid NN regression descriptor semantics")
++    legacy = {name: copy.deepcopy(descriptor[name]) for name in
++              ("kind", "weighting", "fitted_features", "members", "files_sha256")}
++    legacy["schema_version"] = 1
++    for name in ("config.json", "features.json"):
++        value = legacy["files_sha256"].pop(name, None)
++        if not isinstance(value, str) or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
++            raise ValueError("Missing/invalid NN metadata hash: " + name)
++    names = legacy_validator(legacy)
++    models = {member["model_path"] for member in descriptor["members"]}
++    counts = descriptor["training_rows"]
++    if (not isinstance(counts, dict) or set(counts) != models
++            or any(type(n) is not int or n < 1 for n in counts.values())):
++        raise ValueError("NN training-row inventory differs")
++    return sorted([*names, "config.json", "features.json"])
++
++
++def validate_config(cfg, descriptor):
++    from ml_template.models import predictor_selection as selection
++    validate_descriptor(descriptor, selection._legacy_required_predictor_files)
++    if cfg.task != "regression" or cfg.model.type != "nn" or cfg.fitted_features:
++        raise ValueError("NN predictor requires regression and model-owned preprocessing")
++    if descriptor["kind"] == "cv_mean":
++        ids = [member["fold_id"] for member in descriptor["members"]]
++        if ids != list(range(cfg.split.n_folds)):
++            raise ValueError("NN predictor must contain every configured fold")
++
++
++def _json(path):
++    def pairs(items):
++        result = {}
++        for name, value in items:
++            if name in result:
++                raise ValueError("Duplicate NN metadata key")
++            result[name] = value
++        return result
++    def invalid(value):
++        raise ValueError("Nonfinite NN metadata constant: " + value)
++    return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=pairs, parse_constant=invalid)
++
++
++def metadata_frame(info):
++    names = info["features"]
++    if (not isinstance(names, list) or not names or any(not isinstance(c, str) or not c for c in names)
++            or len(names) != len(set(names)) or not isinstance(info.get("dtypes"), dict)
++            or set(info["dtypes"]) != set(names)):
++        raise ValueError("Invalid saved NN input inventory")
++    return pd.DataFrame({name: pd.Series([], dtype=info["dtypes"][name]) for name in names})
++
++
++def bound_metadata(cfg, root, descriptor):
++    from ml_template.models import predictor_selection as selection
++    validate_config(cfg, descriptor)
++    selection.verify_predictor_files(root, descriptor)
++    from ml_template.training.run_config import RunConfig, config_hash
++    archived = RunConfig.model_validate(_json(selection.safe_file(root, "config.json")))
++    if config_hash(archived) != config_hash(cfg):
++        raise ValueError("NN predictor/config snapshot differs")
++    info = _json(selection.safe_file(root, "features.json"))
++    metadata_frame(info)
++    if (info["silver_dataset_version_id"] != cfg.data.silver_dataset_version_id
++            or (info.get("fitted_features") or []) != []):
++        raise ValueError("NN feature metadata/config differs")
++    return info
++
++
++def describe(cfg, root, kind, *, fold_ids=None, verify_artifact=None, training_rows=None):
++    from ml_template.models import predictor_selection as selection
++    from ml_template.tracking.run_artifacts import verify_artifact as original_verify
++    if cfg.task != "regression" or cfg.model.type != "nn" or cfg.fitted_features:
++        raise ValueError("Expected NN regression with embedded preprocessing")
++    verifier = original_verify if verify_artifact is None else verify_artifact
++    # Original immutable artifact names remain unchanged, including legacy .ubj names.
++    legacy = selection._legacy_describe_predictor(cfg, root, kind,
++                                                fold_ids=fold_ids, verify_artifact=verifier)
++    hashes = dict(legacy["files_sha256"])
++    for name in ("config.json", "features.json"):
++        verifier(root, name)
++        hashes[name] = selection.file_sha256(selection.safe_file(root, name))
++    descriptor = {**legacy, "schema_version": 3, "task": "regression", "prediction_kind": "continuous",
++                  "model_type": "nn", "serialization": dict(SERIALIZATION),
++                  "files_sha256": hashes, "training_rows": copy.deepcopy(training_rows)}
++    validate_descriptor(descriptor, selection._legacy_required_predictor_files)
++    bound_metadata(cfg, root, descriptor)
++    return descriptor
++
++
++def validate_gold(cfg, info, descriptor, member, adapter):
++    from ml_template.models.nn.data import resolve_preprocessing
++    pre = adapter.preprocessor
++    expected = resolve_preprocessing(cfg.model.params, metadata_frame(info)).to_dict()
++    if pre.config.to_dict() != expected:
++        raise ValueError("Embedded NN preprocessing/config/input roles differ")
++    if pre.state_dict()["fit_rows"] != descriptor["training_rows"][member["model_path"]]:
++        raise ValueError("Embedded NN preprocessing fit-row count differs from verified partition")
++
++
++class NNRegressionPredictor:
++    def __init__(self, cfg, root, descriptor, *, adapter_loader=None):
++        self.cfg = cfg
++        self.root = Path(root)
++        self.descriptor = copy.deepcopy(descriptor)
++        self.info = bound_metadata(cfg, self.root, self.descriptor)
++        self.adapter_loader = adapter_loader
++
++    def _load_member(self, member):
++        from ml_template.models import predictor_selection as selection
++        selection.verify_predictor_files(self.root, self.descriptor)
++        loader = self.adapter_loader
++        if loader is None:
++            from ml_template.models.model_factory import load_adapter
++            loader = load_adapter
++        try:
++            adapter = loader(self.cfg, selection.safe_file(self.root, member["model_path"]))
++        except ModuleNotFoundError as exc:
++            if exc.name == "torch":
++                raise RuntimeError("PyTorch required: install the project's pytorch extra") from exc
++            raise
++        validate_gold(self.cfg, self.info, self.descriptor, member, adapter)
++        selection.verify_predictor_files(self.root, self.descriptor)
++        return adapter
++
++    def verify_checkpoints(self):
++        # Explicit operation: deserialize all bound checkpoints but never load features/labels or predict.
++        self.info = bound_metadata(self.cfg, self.root, self.descriptor)
++        for member in self.descriptor["members"]:
++            adapter = self._load_member(member)
++            del adapter
++        return {"checkpoints_verified": len(self.descriptor["members"]),
++                "models_loaded": True, "predictions_computed": False, "labels_loaded": False}
++
++    def predict(self, X):
++        from ml_template.models import predictor_selection as selection
++        from ml_template.models.regression_predictor import continuous
++        self.info = bound_metadata(self.cfg, self.root, self.descriptor)
++        if (not isinstance(X, pd.DataFrame) or X.empty or not X.index.is_unique or X.index.hasnans
++                or not X.columns.is_unique or set(X.columns) != set(self.info["features"])):
++            raise ValueError("NN prediction requires a nonempty uniquely keyed estimator-input frame")
++        total = np.zeros(len(X), dtype=np.float64)
++        for member in self.descriptor["members"]:
++            adapter = self._load_member(member)
++            try:
++                before = adapter.preprocessor.state_dict()
++                values = continuous(adapter.predict(X.copy(deep=True)), len(X))
++                if adapter.preprocessor.state_dict() != before:
++                    raise ValueError("NN preprocessing changed during prediction")
++                total += values * member["weight"]
++                selection.verify_predictor_files(self.root, self.descriptor)
++            finally:
++                del adapter
++        return continuous(total, len(X))
++
++
++def load(cfg, root, descriptor, *, adapter_loader=None):
++    return NNRegressionPredictor(cfg, root, descriptor, adapter_loader=adapter_loader)
+diff --git a/src/ml_template/evaluation/nn_predictor_preflight.py b/src/ml_template/evaluation/nn_predictor_preflight.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/evaluation/nn_predictor_preflight.py
+@@ -0,0 +1,81 @@
++"""Package 01: NN metadata check or explicit checkpoint verification; never evaluate."""
++import argparse
++import json
++import sqlite3
++from pathlib import Path
++from typing import Literal
++
++import yaml
++from pydantic import BaseModel, ConfigDict, Field
++
++
++class PredictorRequest(BaseModel):
++    model_config = ConfigDict(extra="forbid", frozen=True)
++    parent_run_id: str = Field(min_length=1)
++    predictor_kind: Literal["final", "cv_mean"] = "final"
++    database: str = "data/project.db"
++    expected_silver_dataset_version_id: str | None = None
++    expected_feature_set_id: str | None = None
++    expected_split_id: str | None = None
++
++
++def check_predictor(engine, request, *, verify_checkpoints=False, **roots):
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.evaluation.regression_inputs import prepare_nn_regression_predictor_inputs
++    from ml_template.models.predictor_selection import load_selected_predictor
++    spec = RegressionEvaluationConfig(parent_run_id=request.parent_run_id,
++        predictor={"kind": request.predictor_kind},
++        expected_silver_dataset_version_id=request.expected_silver_dataset_version_id,
++        expected_feature_set_id=request.expected_feature_set_id,
++        expected_split_id=request.expected_split_id)
++    prepared = prepare_nn_regression_predictor_inputs(engine, spec, **roots)
++    result = {"ready": True, "package": "nn_lifecycle_01", "purpose": "predictor_only",
++              "parent_run_id": request.parent_run_id, "predictor_kind": request.predictor_kind,
++              "descriptor_schema": 3, "models_loaded": False, "predictions_computed": False,
++              "labels_loaded": False, "holdout_labels_loaded": False, "files_written": False,
++              "evaluation_enabled": False, "calibration_enabled": False, "release_enabled": False,
++              "torch_version": prepared.provenance["versions"]["torch"],
++              "predictor": prepared.provenance["predictor"]}
++    if verify_checkpoints:
++        model = load_selected_predictor(prepared.run_cfg, prepared.run_dir,
++                                        prepared.provenance["predictor"])
++        result.update(model.verify_checkpoints())
++    return result
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--config", required=True, type=Path)
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument("--check", action="store_true")
++    mode.add_argument("--verify-checkpoints", action="store_true")
++    args = parser.parse_args(argv)
++    class UniqueLoader(yaml.SafeLoader):
++        pass
++    def mapping(loader, node, deep=False):
++        result = {}
++        for key_node, value_node in node.value:
++            key = loader.construct_object(key_node, deep=deep)
++            if key in result:
++                raise ValueError("Duplicate predictor request key")
++            result[key] = loader.construct_object(value_node, deep=deep)
++        return result
++    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
++    request = PredictorRequest.model_validate(yaml.load(args.config.read_text(), Loader=UniqueLoader))
++    from sqlalchemy import create_engine
++    from ml_template.paths import ROOT
++    path = Path(request.database).expanduser()
++    path = (path if path.is_absolute() else ROOT / path).resolve()
++    if not path.is_file():
++        raise FileNotFoundError(path)
++    # Existing registry API gets a real SQLAlchemy engine, backed by SQLite mode=ro.
++    engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(path.as_uri() + "?mode=ro", uri=True))
++    try:
++        print(json.dumps(check_predictor(engine, request,
++                                        verify_checkpoints=args.verify_checkpoints), indent=2))
++    finally:
++        engine.dispose()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/models/test_nn_lifecycle_01.py b/tests/models/test_nn_lifecycle_01.py
+new file mode 100644
+--- /dev/null
++++ b/tests/models/test_nn_lifecycle_01.py
+@@ -0,0 +1,132 @@
++"""Torch-free descriptor, binding and pre-deserialization safety tests."""
++import copy
++import hashlib
++from types import SimpleNamespace
++
++import pandas as pd
++import pytest
++
++from ml_template.models import predictor_selection as selection
++from ml_template.models.nn_regression_predictor import (
++    NNRegressionPredictor, SERIALIZATION, metadata_frame, validate_config, validate_descriptor,
++)
++from ml_template.evaluation.nn_predictor_preflight import PredictorRequest
++
++
++def descriptor(kind="final"):
++    members = [{"fold_id": None, "model_path": "model.ubj", "transformer_path": None, "weight": 1.}]
++    if kind == "cv_mean":
++        members = [{"fold_id": k, "model_path": f"fold_models/fold_{k}.ubj", "transformer_path": None, "weight": .5} for k in range(2)]
++    names = ["config.json", "features.json", *[m["model_path"] for m in members]]
++    if kind == "cv_mean":
++        names += ["cv_folds.csv"]
++    return {"schema_version": 3, "task": "regression", "prediction_kind": "continuous", "model_type": "nn",
++            "serialization": dict(SERIALIZATION), "kind": kind, "weighting": "equal", "fitted_features": False,
++            "members": members, "files_sha256": {n: "0" * 64 for n in names},
++            "training_rows": {m["model_path"]: 10 for m in members}}
++
++
++@pytest.mark.parametrize("kind", ["final", "cv_mean"])
++def test_valid_explicit_nn_descriptor(kind):
++    d = descriptor(kind)
++    assert set(validate_descriptor(d, selection._legacy_required_predictor_files)) == set(d["files_sha256"])
++
++
++@pytest.mark.parametrize("field,value", [("schema_version", True), ("schema_version", 2), ("task", "binary_classification"),
++    ("prediction_kind", "probability"), ("model_type", "xgb"), ("serialization", {}),
++    ("fitted_features", True), ("training_rows", None), ("training_rows", {"model.ubj": True}),
++    ("training_rows", {"model.ubj": 0}), ("files_sha256", None), ("members", []), ("weighting", "learned")])
++def test_bad_descriptor_fields(field, value):
++    d = descriptor(); d[field] = value
++    with pytest.raises(ValueError):
++        validate_descriptor(d, selection._legacy_required_predictor_files)
++
++
++@pytest.mark.parametrize("change", ["extra", "metadata_missing", "hash", "path", "sidecar", "weight", "format_version_bool"])
++def test_descriptor_integrity(change):
++    d = descriptor()
++    if change == "extra":
++        d["extra"] = True
++    elif change == "metadata_missing":
++        del d["files_sha256"]["features.json"]
++    elif change == "hash":
++        d["files_sha256"]["config.json"] = "z" * 64
++    elif change == "path":
++        d["members"][0]["model_path"] = "../escape.ubj"
++    elif change == "sidecar":
++        d["members"][0]["transformer_path"] = "model.transformer.joblib"
++    elif change == "weight":
++        d["members"][0]["weight"] = .9
++    else:
++        d["serialization"]["checkpoint_version"] = True
++    with pytest.raises(ValueError):
++        validate_descriptor(d, selection._legacy_required_predictor_files)
++
++
++@pytest.mark.parametrize("change", ["fold", "reordered", "weight", "duplicate", "missing_count"])
++def test_incomplete_cv_inventory(change):
++    d = descriptor("cv_mean")
++    if change == "fold":
++        d["members"][0]["fold_id"] = True
++    elif change == "reordered":
++        d["members"].reverse()
++    elif change == "weight":
++        d["members"][0]["weight"] = .6
++    elif change == "duplicate":
++        d["members"][1] = copy.deepcopy(d["members"][0])
++    else:
++        d["training_rows"].pop("fold_models/fold_0.ubj")
++    with pytest.raises(ValueError):
++        validate_descriptor(d, selection._legacy_required_predictor_files)
++
++
++@pytest.mark.parametrize("task,model,fitted,folds", [("binary_classification", "nn", None, 2),
++    ("regression", "xgb", None, 2), ("regression", "nn", [{"step": "bad"}], 2), ("regression", "nn", None, 3)])
++def test_config_task_owner_and_fold_binding(task, model, fitted, folds):
++    cfg = SimpleNamespace(task=task, model=SimpleNamespace(type=model), fitted_features=fitted, split=SimpleNamespace(n_folds=folds))
++    with pytest.raises(ValueError):
++        validate_config(cfg, descriptor("cv_mean"))
++
++
++@pytest.mark.parametrize("kind", ["final", "cv_mean"])
++def test_config_accepts_full_inventory(kind):
++    cfg = SimpleNamespace(task="regression", model=SimpleNamespace(type="nn"), fitted_features=None, split=SimpleNamespace(n_folds=2))
++    validate_config(cfg, descriptor(kind))
++
++
++def test_tampering_rejected_before_adapter_loader(tmp_path):
++    d = descriptor()
++    for name in d["files_sha256"]:
++        (tmp_path / name).write_bytes(b"original")
++        d["files_sha256"][name] = hashlib.sha256(b"original").hexdigest()
++    (tmp_path / "model.ubj").write_bytes(b"tampered")
++    obj = object.__new__(NNRegressionPredictor)
++    obj.root = tmp_path; obj.descriptor = d
++    obj.cfg = None; obj.info = {}
++    obj.adapter_loader = lambda *a: pytest.fail("tampered checkpoint reached loader")
++    with pytest.raises(ValueError, match="changed"):
++        obj._load_member(d["members"][0])
++
++
++@pytest.mark.parametrize("info", [{"features": ["a", "a"], "dtypes": {"a": "float64"}},
++    {"features": ["a"], "dtypes": {}}, {"features": [], "dtypes": {}}, {"features": ["a"], "dtypes": None}])
++def test_bad_feature_inventory(info):
++    with pytest.raises(ValueError):
++        metadata_frame(info)
++
++
++def test_feature_roles_can_be_resolved_without_rows():
++    frame = metadata_frame({"features": ["a", "k"], "dtypes": {"a": "Float64", "k": "category"}})
++    assert frame.empty and list(frame) == ["a", "k"]
++    assert isinstance(frame.k.dtype, pd.CategoricalDtype)
++
++
++@pytest.mark.parametrize("value", ["bad", "probability"])
++def test_request_predictor_kind_strict(value):
++    with pytest.raises(ValueError):
++        PredictorRequest(parent_run_id="run_test", predictor_kind=value)
++
++
++def test_request_does_not_authorise_evaluation():
++    with pytest.raises(ValueError):
++        PredictorRequest(parent_run_id="run_test", execute=True)
+diff --git a/tests/models/test_nn_lifecycle_01_native.py b/tests/models/test_nn_lifecycle_01_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/models/test_nn_lifecycle_01_native.py
+@@ -0,0 +1,210 @@
++"""Real CPU NN train -> metadata -> verified predictor acceptance; synthetic data only."""
++import copy
++import json
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import pytest
++
++
++@pytest.fixture(params=[False, True], ids=["raw", "stateless"])
++def trained(request, tmp_path, monkeypatch):
++    torch = pytest.importorskip("torch")
++    pytest.importorskip("pyarrow")
++    sqlalchemy = pytest.importorskip("sqlalchemy")
++    from ml_template import paths
++    from ml_template.features.feature_set_store import build_block, create_feature_set
++    from ml_template.scoring.release_artifacts import sha256
++    from ml_template.training import experiment_runner as runner
++    from ml_template.training.run_config import RunConfig
++    from ml_template.training.split import make_split, save_split
++    sr, sp, fr = tmp_path / "silver", tmp_path / "splits", tmp_path / "features"
++    fr.mkdir()
++    monkeypatch.setattr(paths, "DATA_SILVER", sr)
++    monkeypatch.setattr(paths, "DATA_SPLITS", sp)
++    monkeypatch.setattr(paths, "DATA_FEATURES", fr)
++    contract = tmp_path / "contract.yaml"
++    contract.write_text(
++        "data: {task: regression, entity_id: id, target: y}\n"
++        "bronze_source_contract:\n  roles: {id: [id], feature: [a, b, k], target: [y]}\n"
++        "silver_eda_contract:\n  canonical_names: {id: id, a: a, b: b, k: k, y: y}\n"
++        "  canonical_dtypes: {id: int64, a: float64, b: float64, k: string, y: float64}\n"
++        "  value_mappings: {}\n  allowed_values: {}\n  missingness: {default_max_rate: 1.0}\n")
++    a = np.linspace(-3., 4., 80)
++    df = pd.DataFrame({"id": np.arange(80), "a": a, "b": np.tile([1., 2., 3., 2.], 20),
++                       "k": np.tile(["u", "v"], 40)})
++    df["y"] = 2.5 * a + (df.k == "u").astype(float) * .5
++    df.loc[df.id % 7 == 0, "a"] = np.nan
++    df.loc[df.id % 11 == 0, "k"] = None
++    sd = sr / "test/silver_test"; sd.mkdir(parents=True)
++    df.to_parquet(sd / "data.parquet", index=False)
++    (sd / "manifest.json").write_text(json.dumps({"silver_dataset_version_id": "silver_test",
++        "validation_passed": True, "config_sha256": sha256(contract),
++        "columns": {c: str(t) for c, t in df.dtypes.items()},
++        "roles": {"id": ["id"], "feature": ["a", "b", "k"], "target": ["y"]},
++        "parquet_sha256": sha256(sd / "data.parquet")}))
++    fsid = None
++    if request.param:
++        raw = df.set_index("id")[["a", "b", "k"]]
++        block = build_block("generic_interactions", raw, "silver_test",
++            params={"numeric_pairs": [{"a": "a", "b": "b", "ops": ["ratio"]}], "category_pairs": []}, root=fr)
++        fs = create_feature_set("silver_test", [block["block_id"]], raw_columns=list(raw),
++                                columns=["a", "b", "k", "a__div__b"], root=fr)
++        fsid = fs["feature_set_id"]
++    cfg = RunConfig.model_validate({"task": "regression", "experiment_name": "nn_package_01",
++        "data": {"dataset_name": "test", "dataset_config": str(contract),
++                 "silver_dataset_version_id": "silver_test", "feature_set_id": fsid},
++        "split": {"method": "random", "n_folds": 2, "calibration_fraction": .1, "recalibration_fraction": .1},
++        "analysis": {"permutation_importance": False, "error_sample_size": 0, "learning_curves": False},
++        "model": {"type": "nn", "params": {"task": "regression", "hidden_dims": [4],
++            "max_epochs": 2, "patience": 2, "batch_size": 8, "prediction_batch_size": 8,
++            "dropout": 0., "embedding_dropout": 0., "device": "cpu", "inference_device": "cpu"}}})
++    assignment = make_split(df, cfg.split, "id", "y")
++    save_split(assignment, "silver_test", cfg.split, "id", "y", df.y, sp)
++    original_loader = runner.load_run_inputs
++    monkeypatch.setattr(runner, "load_run_inputs", lambda cfg, **kwargs: original_loader(cfg, feature_root=fr, **kwargs))
++    engine = sqlalchemy.create_engine(f"sqlite:///{tmp_path / 'project.db'}")
++    result = runner.run_experiment([cfg], engine, kind="single", run_root=tmp_path / "runs",
++                                  log_root=tmp_path / "logs", silver_root=sr, split_root=sp)
++    assert not result["failures"], result
++    rid = result["run_ids"][0]
++    # Preserve all training evidence while testing predictor-only operations.
++    parent = tmp_path / "runs" / rid
++    before = {p.relative_to(parent).as_posix(): sha256(p) for p in parent.rglob("*") if p.is_file()}
++    yield {"cfg": cfg, "engine": engine, "rid": rid, "root": parent, "df": df,
++           "assignment": assignment, "roots": {"silver_root": sr, "split_root": sp, "feature_root": fr},
++           "parquet": sd / "data.parquet", "torch": torch, "sha256": sha256, "before": before}
++    assert before == {p.relative_to(parent).as_posix(): sha256(p) for p in parent.rglob("*") if p.is_file()}
++    engine.dispose()
++
++
++def prepare(trained, kind):
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.evaluation.regression_inputs import prepare_nn_regression_predictor_inputs
++    return prepare_nn_regression_predictor_inputs(trained["engine"],
++        RegressionEvaluationConfig(parent_run_id=trained["rid"], predictor={"kind": kind}), **trained["roots"])
++
++
++def estimator_input(prepared, trained):
++    from ml_template.features.prepared_recipe import prepare_frame
++    plan = prepared.provenance["feature_preparation"]
++    raw = trained["df"].set_index("id").loc[[1, 2, 3, 4], plan["recipe"]["raw_columns"]].copy()
++    return prepare_frame(raw, plan["recipe"], plan["model_schema"])
++
++
++@pytest.mark.parametrize("kind", ["final", "cv_mean"])
++def test_real_cpu_predictors_and_frozen_gold(trained, monkeypatch, kind):
++    from ml_template.models.model_factory import load_adapter
++    from ml_template.models.nn_regressor import NNRegressionAdapter
++    from ml_template.models.predictor_selection import load_selected_predictor
++    from ml_template.preprocessing.nn_preprocessor import NNPreprocessor
++    old_read = pd.read_parquet
++    def no_source_values(path, *args, **kwargs):
++        if Path(path) == trained["parquet"]:
++            pytest.fail("metadata/predictor accessed historical source values")
++        return old_read(path, *args, **kwargs)
++    monkeypatch.setattr(pd, "read_parquet", no_source_values)
++    original_torch_load = trained["torch"].load
++    monkeypatch.setattr(trained["torch"], "load", lambda *a, **k: pytest.fail("metadata check deserialized a checkpoint"))
++    p = prepare(trained, kind)
++    assert p.purpose == "predictor_only" and "torch" in p.provenance["versions"]
++    d = p.provenance["predictor"]
++    assert d["schema_version"] == 3 and d["serialization"]["preprocessing"] == "embedded"
++    monkeypatch.setattr(trained["torch"], "load", original_torch_load)
++    monkeypatch.setattr(NNPreprocessor, "fit", lambda *a, **k: pytest.fail("prediction fitted preprocessing"))
++    monkeypatch.setattr(NNRegressionAdapter, "_train", lambda *a, **k: pytest.fail("prediction fitted model"))
++    predictor = load_selected_predictor(p.run_cfg, p.run_dir, d)
++    verified = predictor.verify_checkpoints()
++    assert not verified["predictions_computed"] and not verified["labels_loaded"]
++    X = estimator_input(p, trained)
++    whole = predictor.predict(X)
++    chunks = np.concatenate([predictor.predict(X.iloc[i:i+1]) for i in range(len(X))])
++    shuffled = predictor.predict(X.iloc[::-1])[::-1]
++    assert whole.shape == (len(X),) and np.isfinite(whole).all()
++    np.testing.assert_allclose(whole, chunks, rtol=0, atol=1e-6)
++    np.testing.assert_allclose(whole, shuffled, rtol=0, atol=1e-6)
++    direct = []
++    dev = trained["assignment"].query("partition == 'dev'")
++    for m in d["members"]:
++        adapter = load_adapter(p.run_cfg, p.run_dir / m["model_path"])
++        gold = adapter.preprocessor.state_dict()
++        keys = dev.id if m["fold_id"] is None else dev.loc[dev.fold != m["fold_id"], "id"]
++        assert gold["fit_rows"] == len(keys) == d["training_rows"][m["model_path"]]
++        observed = trained["df"].set_index("id").loc[keys, "a"].dropna()
++        assert gold["numeric_state"]["a"]["fill"] == pytest.approx(float(observed.median()))
++        assert gold["numeric_state"]["a"]["center"] == pytest.approx(float(observed.mean()))
++        direct.append(adapter.predict(X))
++        assert adapter.preprocessor.state_dict() == gold
++    np.testing.assert_allclose(whole, np.mean(direct, axis=0), rtol=0, atol=1e-6)
++    missing = X.copy(); missing.loc[missing.index[0], "b"] = np.nan
++    unknown = X.copy(); unknown["k"] = unknown["k"].astype(object); unknown.loc[unknown.index[0], "k"] = "unseen"
++    assert np.isfinite(predictor.predict(missing)).all()
++    assert np.isfinite(predictor.predict(unknown)).all()
++    with pytest.raises(ValueError):
++        predictor.predict(X.assign(y=0.))
++    with pytest.raises(ValueError):
++        predictor.predict(X.set_axis([1, 1, 2, 3]))
++
++
++def test_lifecycle_gate_still_blocks_nn(trained, monkeypatch):
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.evaluation.regression_inputs import prepare_regression, load_holdout
++    old = pd.read_parquet
++    def forbid_source(path, *args, **kwargs):
++        if Path(path) == trained["parquet"]:
++            pytest.fail("unauthorised source decode")
++        return old(path, *args, **kwargs)
++    monkeypatch.setattr(pd, "read_parquet", forbid_source)
++    spec = RegressionEvaluationConfig(parent_run_id=trained["rid"])
++    with pytest.raises(ValueError, match="Expected XGB"):
++        prepare_regression(trained["engine"], spec, **trained["roots"])
++    p = prepare(trained, "final")
++    with pytest.raises(ValueError, match="does not authorise"):
++        load_holdout(p)
++
++
++def test_wrong_config_and_gold_partition_binding(trained):
++    from ml_template.models.model_factory import load_adapter
++    from ml_template.models.nn_regression_predictor import validate_gold
++    from ml_template.models.predictor_selection import load_selected_predictor
++    p = prepare(trained, "final"); d = p.provenance["predictor"]
++    wrong = p.run_cfg.model_copy(update={"seed": p.run_cfg.seed + 1})
++    with pytest.raises(ValueError, match="snapshot differs"):
++        load_selected_predictor(wrong, p.run_dir, d)
++    m = d["members"][0]; adapter = load_adapter(p.run_cfg, p.run_dir / m["model_path"])
++    changed = copy.deepcopy(d); changed["training_rows"][m["model_path"]] += 1
++    with pytest.raises(ValueError, match="fit-row count"):
++        validate_gold(p.run_cfg, p.feature_info, changed, m, adapter)
++
++
++def test_checkpoint_hash_checked_before_torch_load(trained, tmp_path, monkeypatch):
++    import shutil
++    from ml_template.models.predictor_selection import load_selected_predictor
++    p = prepare(trained, "final")
++    clone = tmp_path / "tampered_clone"
++    shutil.copytree(p.run_dir, clone)
++    (clone / "model.ubj").write_bytes(b"not an authenticated checkpoint")
++    monkeypatch.setattr(trained["torch"], "load", lambda *a, **k: pytest.fail("tampered checkpoint deserialized"))
++    with pytest.raises(ValueError, match="changed"):
++        load_selected_predictor(p.run_cfg, clone, p.provenance["predictor"])
++
++
++@pytest.mark.parametrize("kind", ["task", "seed", "preprocessing"])
++def test_invalid_payload_semantics(trained, tmp_path, kind):
++    from ml_template.models.nn_regressor import NNRegressionAdapter
++    from ml_template.models.nn_regression_predictor import validate_gold
++    p = prepare(trained, "final"); d = p.provenance["predictor"]
++    raw = trained["torch"].load(p.run_dir / "model.ubj", map_location="cpu", weights_only=True)
++    if kind == "task":
++        raw["task"] = "binary_classification"
++    elif kind == "seed":
++        raw["seed"] += 1
++    else:
++        raw["preprocessor"]["config"]["numeric_strategy"] = "mean"
++    # New standalone invalid fixture; never edit/reseal the trained parent.
++    bad = tmp_path / ("bad_" + kind + ".ubj")
++    trained["torch"].save(raw, bad)
++    with pytest.raises(ValueError):
++        adapter = NNRegressionAdapter.load(p.run_cfg.model.params, p.run_cfg.seed, bad)
++        validate_gold(p.run_cfg, p.feature_info, d, d["members"][0], adapter)
+diff --git a/configs/predictor/concrete_nn_package_01.yaml b/configs/predictor/concrete_nn_package_01.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/predictor/concrete_nn_package_01.yaml
+@@ -0,0 +1,8 @@
++# Package 01 only: metadata / checkpoint verification. Not an evaluation or release request.
++parent_run_id: run_20261111_135508_ccf0e8
++predictor_kind: final
++# Set cv_mean to verify every stored outer-fold checkpoint instead.
++database: data/project.db
++expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
++expected_feature_set_id: null
++expected_split_id: split_841e3a09cb9d

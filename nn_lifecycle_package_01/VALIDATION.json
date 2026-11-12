@@ -1,0 +1,35 @@
+{
+  "package": "nn_lifecycle_01",
+  "base_commit": "063519f55522852957273dd6c0d691420411e8aa",
+  "executed": {
+    "pure_cases": 42,
+    "method": "actual new module + isolated existing-verifier source fragments; no native backend",
+    "syntax": "Python 3.11 grammar and compile on Python 3.12.8",
+    "full_original_inputs_blob": "e9202af9a2cfa5ee9727a4098b0040a5ee49073b",
+    "installer": "private fixture check/apply/idempotence/rollback/dependency rejection",
+    "patch": "context git apply check and application"
+  },
+  "not_executed": [
+    "16 real CPU NN native acceptance cases",
+    "real saved-run preflight",
+    "full suite",
+    "Ruff",
+    "CUDA",
+    "native other-Python versions"
+  ],
+  "unavailable": [
+    "torch",
+    "pyarrow",
+    "sqlalchemy"
+  ],
+  "source_guard": "exact Git byte hashes; no AST fingerprints",
+  "scope": {
+    "training_change": false,
+    "evaluation_enabled": false,
+    "calibration_enabled": false,
+    "release_enabled": false,
+    "labels_loaded_by_cli": false,
+    "parent_artifacts_modified": false,
+    "registry_schema_writes": false
+  }
+}

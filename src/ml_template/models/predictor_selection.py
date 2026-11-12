@@ -252,6 +252,10 @@ def load_evaluation_predictor(prepared, *, adapter_loader=None):
 
 
 def required_predictor_files(descriptor):
+    if descriptor.get("schema_version") == 3:
+        from ml_template.models.nn_regression_predictor import validate_descriptor
+
+        return validate_descriptor(descriptor, _legacy_required_predictor_files)
     if descriptor.get("schema_version") == 2:
         from ml_template.models.regression_predictor import validate_descriptor
 
@@ -261,7 +265,27 @@ def required_predictor_files(descriptor):
     return _legacy_required_predictor_files(descriptor)
 
 
-def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None):
+def _is_nn_regression(cfg):
+    return (
+        getattr(cfg, "task", None) == "regression"
+        and getattr(getattr(cfg, "model", None), "type", None) == "nn"
+    )
+
+
+def describe_predictor(
+    cfg, run_dir, kind="final", *, fold_ids=None, verify_artifact=None, training_rows=None
+):
+    if _is_nn_regression(cfg):
+        from ml_template.models.nn_regression_predictor import describe
+
+        return describe(
+            cfg,
+            run_dir,
+            kind,
+            fold_ids=fold_ids,
+            verify_artifact=verify_artifact,
+            training_rows=training_rows,
+        )
     if getattr(cfg, "task", "binary_classification") == "regression":
         from ml_template.models.regression_predictor import describe
 
@@ -272,6 +296,11 @@ def describe_predictor(cfg, run_dir, kind="final", *, fold_ids=None, verify_arti
 
 
 def _validate_against_config(cfg, descriptor):
+    neural = _is_nn_regression(cfg)
+    if neural or descriptor.get("schema_version") == 3:
+        from ml_template.models.nn_regression_predictor import validate_config
+
+        return validate_config(cfg, descriptor)
     regression = getattr(cfg, "task", "binary_classification") == "regression"
     if regression != (descriptor.get("schema_version") == 2):
         raise ValueError("Predictor task/schema disagrees with run configuration")
@@ -279,6 +308,10 @@ def _validate_against_config(cfg, descriptor):
 
 
 def load_selected_predictor(cfg, root, descriptor=None, *, adapter_loader=None):
+    if _is_nn_regression(cfg):
+        from ml_template.models.nn_regression_predictor import load
+
+        return load(cfg, root, descriptor, adapter_loader=adapter_loader)
     if getattr(cfg, "task", "binary_classification") == "regression":
         from ml_template.models.regression_predictor import load
 

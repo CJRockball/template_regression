@@ -1,0 +1,30 @@
+{
+  "src/ml_template/models/predictor_selection.py": {
+    "before": "7ef29b33b701185f5ecaf6bca2d073dcfe2e8134e9e3d67aeee7b12b68ec6831",
+    "after": "22754ccd2889d13575b6f298b4ca5e066cf9b17c82f24cb56fa4aceba8d3ce83"
+  },
+  "src/ml_template/evaluation/regression_inputs.py": {
+    "before": "e42b3366aac599b55c3565f7ffc87aff8ea77e586e92b8ef1eb885d1ec29a0bd",
+    "after": "e96e5298d90e57ce039b782915579d98fcb971fa3d7d6734e6f371293248cf76"
+  },
+  "src/ml_template/models/nn_regression_predictor.py": {
+    "before": null,
+    "after": "86e7e30b4992e1a0d38f400d9d26da42167f68c11d5b526ed57806cb11c671e4"
+  },
+  "src/ml_template/evaluation/nn_predictor_preflight.py": {
+    "before": null,
+    "after": "991c7c444d657d940bd967c87ea49d6c56640beaaca403ce936b9ff9d3db4ef1"
+  },
+  "tests/models/test_nn_lifecycle_01.py": {
+    "before": null,
+    "after": "6a2ada117bf12721d029ae68d46a16ca49e3ee5b6818e21bea44ba62d461b538"
+  },
+  "tests/models/test_nn_lifecycle_01_native.py": {
+    "before": null,
+    "after": "9d85fe9bcea3ade977b0d346715e54f7b0d87cc724fdb786f05133ba3324f2bf"
+  },
+  "configs/predictor/concrete_nn_package_01.yaml": {
+    "before": null,
+    "after": "3f81ae13bfe89be897070890fce0581bce5bf5b51409cb1a9f85a41a4fe5882b"
+  }
+}
