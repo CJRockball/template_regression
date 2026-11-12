@@ -1,0 +1,26 @@
+{
+  "src/ml_template/scoring/regression_release.py": {
+    "before": "97e0657ef25980355412223481cbb35e8705bbeed33323ce4f65a3354c2a51fe",
+    "after": "56681ce86b3c1d7bc4f851d4523b95ec5ee2cb52bbcc24253545291fd847c8d9"
+  },
+  "src/ml_template/scoring/regression_predictor.py": {
+    "before": "f3bac221a061991d0ad7d9e68cb3e6e46088cb9d4af25c8a275ad687de0ff4e5",
+    "after": "7daf4ecd0747e3e5dc93be7281348aa2e69aebaa5f596f8d561c0d522fea231a"
+  },
+  "src/ml_template/scoring/nn_release.py": {
+    "before": null,
+    "after": "0a73bac1f6f42cf92884a3757479dd7e321653a8c1de5908e82e6a523770ed29"
+  },
+  "tests/scoring/test_nn_lifecycle_04.py": {
+    "before": null,
+    "after": "55e0367c4ac2554fddf6b92cb834b54fea5342c6b5f52a6677f36ac86a0d560a"
+  },
+  "tests/scoring/test_nn_lifecycle_04_native.py": {
+    "before": null,
+    "after": "dec39eb7959a30e13f978740105fdcc7cccaa22645a0cca99768614e926048f4"
+  },
+  "configs/release/concrete_nn_package_04.example.yaml": {
+    "before": null,
+    "after": "50ff4313a11a3737f9dd620b2ccf1f6051dc440b2a76fcb6a6bb6e093d8b1105"
+  }
+}

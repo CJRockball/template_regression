@@ -1,0 +1,580 @@
+diff --git a/src/ml_template/scoring/regression_release.py b/src/ml_template/scoring/regression_release.py
+--- a/src/ml_template/scoring/regression_release.py
++++ b/src/ml_template/scoring/regression_release.py
+@@ -20,6 +20,10 @@
+ 
+ 
+ def regression_evidence(engine, request):
++    from ml_template.scoring.nn_release import is_nn_parent, evidence
++
++    if is_nn_parent(engine, request.parent_run_id):
++        return evidence(engine, request)
+     from ml_template.db.evaluation_registry import get_evaluation
+     from ml_template.evaluation.evaluation_inputs import digest
+     from ml_template.evaluation.regression_config import RegressionEvaluationConfig
+@@ -67,6 +71,8 @@
+ 
+ 
+ def prepare_regression_release(engine, request):
++    from ml_template.scoring.nn_release import neural_config
++
+     from ml_template.features.feature_set_store import resolve_feature_set
+     from ml_template.features.prepared_recipe import prepare_frame, verify_prepared
+     from ml_template.scoring.input_contract import coerce_frame, validate_batch
+@@ -116,6 +122,8 @@
+         source_policy=source_policy,
+         model_policy=model_policy,
+     )
++    if neural_config(getattr(p, "run_cfg", None)):
++        contract["estimator_validation"] = "saved_nn_adapter_finite_arrays"
+     validate_batch(source.reset_index(), contract, enforce_rates=True)
+     return {
+         "prepared": p,
+@@ -133,6 +141,10 @@
+ 
+ 
+ def check_regression_parity(predictor, material, atol):
++    from ml_template.scoring.nn_release import neural_config, check_parity
++
++    if neural_config(getattr(material["prepared"], "run_cfg", None)):
++        return check_parity(predictor, material, atol)
+     p = material["prepared"]
+     path = material["evaluation_dir"] / "holdout_predictions.parquet"
+     expected_hash = material["reference_sha256"]
+@@ -189,9 +201,16 @@
+ 
+ 
+ def build_regression_release(engine, request, *, check_only=False, output_root=None):
++    from ml_template.scoring.nn_release import neural_config
++
+     material = prepare_regression_release(engine, request)
+     p, spec = (material["prepared"], material["spec"])
+     if check_only:
++        if neural_config(getattr(p, "run_cfg", None)):
++            from ml_template.paths import ARTIFACTS
++            from ml_template.scoring.nn_release import validate_destination
++
++            validate_destination(p, output_root or ARTIFACTS / "releases")
+         return {
+             "ready": True,
+             "task": "regression",
+@@ -201,12 +220,19 @@
+             "holdout_labels_loaded": False,
+             "parity_executed": False,
+             "files_written": False,
++            **({"model_type": "nn", "models_loaded": False, "predictions_computed": False,
++                "source_features_loaded": True, "labels_loaded": False}
++               if neural_config(getattr(p, "run_cfg", None)) else {}),
+         }
+     from ml_template.db.scoring_registry import register_release
+     from ml_template.paths import ARTIFACTS
+     from ml_template.scoring.predictor import ReleasedPredictor
+ 
+     root = Path(output_root or ARTIFACTS / "releases").resolve()
++    if neural_config(getattr(p, "run_cfg", None)):
++        from ml_template.scoring.nn_release import validate_destination
++
++        validate_destination(p, root)
+     root.mkdir(parents=True, exist_ok=True)
+     stage = Path(tempfile.mkdtemp(prefix=".regression-release-", dir=root))
+     try:
+@@ -236,6 +262,8 @@
+             "evaluation_summary": material["summary"],
+             "limitations": list(spec.limitations),
+         }
++        if neural_config(getattr(p, "run_cfg", None)):
++            info.update(model_type="nn", target_unit=spec.target_unit)
+         from ml_template.evaluation.regression_postprocessing import package
+ 
+         package(stage, material, info)
+@@ -253,7 +281,7 @@
+                 "evaluation_summary": material["summary"],
+             },
+         )
+-        for name in ["config.json", "features.json", *descriptor["files_sha256"]]:
++        for name in dict.fromkeys(["config.json", "features.json", *descriptor["files_sha256"]]):
+             dest = inside(stage, name)
+             dest.parent.mkdir(parents=True, exist_ok=True)
+             shutil.copyfile(p.run_dir / name, dest)
+diff --git a/src/ml_template/scoring/regression_predictor.py b/src/ml_template/scoring/regression_predictor.py
+--- a/src/ml_template/scoring/regression_predictor.py
++++ b/src/ml_template/scoring/regression_predictor.py
+@@ -93,6 +93,9 @@
+         from ml_template.evaluation.regression_postprocessing import load_packaged
+ 
+         self.postprocessing = load_packaged(self.directory, self.info, provenance, spec)
++        from ml_template.scoring.nn_release import validate_packaged_nn
++
++        validate_packaged_nn(cfg, self.info, self.contract, descriptor, evidence)
+         self.model = load_selected_predictor(cfg, self.directory, descriptor)
+ 
+     def _prepare_source_features(self, source):
+diff --git a/src/ml_template/scoring/nn_release.py b/src/ml_template/scoring/nn_release.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/scoring/nn_release.py
+@@ -0,0 +1,160 @@
++"""NN release evidence adapter/CLI; reuses shared sealed release construction."""
++import argparse
++import json
++import sqlite3
++from pathlib import Path
++import numpy as np
++from ml_template.evaluation.nn_evaluate import is_nn_parent
++
++def neural_config(cfg):
++    return getattr(getattr(cfg, 'model', None), 'type', None) == 'nn' and getattr(cfg, 'task', None) == 'regression'
++
++def evidence(engine, request):
++    from ml_template.evaluation.nn_evaluate import record, verify_cache, prepare_nn_evaluation
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.scoring.release_artifacts import runtime_info
++    from ml_template.features.prepared_recipe import verify_prediction_code
++    item = record(engine, request.evaluation_id)
++    if not item or item['status'] != 'succeeded':
++        raise ValueError('Explicit successful NN evaluation required')
++    data = verify_cache(engine, item, item['identity_hash'])
++    spec = RegressionEvaluationConfig.model_validate(data['spec'])
++    if spec.parent_run_id != request.parent_run_id or request.calibration_id != spec.calibration_id:
++        raise ValueError('NN release request differs from evaluated parent/calibration')
++    p = prepare_nn_evaluation(engine, spec)
++    old = data['provenance']
++    if not neural_config(p.run_cfg) or p.spec != spec or p.provenance['predictor'] != old['predictor'] or (p.provenance['input_hashes'] != old['input_hashes']) or (p.provenance['feature_preparation'] != old['feature_preparation']) or (p.provenance['versions'] != old['versions']) or (p.provenance['python'] != old['python']) or (data['summary']['n_rows'] != len(p.hold_keys)):
++        raise ValueError('Evaluated NN predictor/data/preprocessing/runtime changed')
++    verify_prediction_code(old['code_hashes'], runtime_info()['code_sha256'])
++    return (p, Path(item['artifact_dir']), spec, data['summary'], old)
++
++def validate_packaged_nn(cfg, info, contract, descriptor, evidence):
++    neural = neural_config(cfg)
++    declared = info.get('model_type') == 'nn' or descriptor.get('model_type') == 'nn'
++    if not neural:
++        if declared:
++            raise ValueError('NN release metadata conflicts with model configuration')
++        return
++    spec = evidence['evaluation_spec']
++    summary = evidence['evaluation_summary']
++    if cfg.fitted_features or info.get('model_type') != 'nn' or descriptor.get('schema_version') != 3 or (descriptor.get('serialization') != {'format': 'torch', 'weights_only': True, 'checkpoint_version': 1, 'preprocessing': 'embedded'}) or (summary.get('model_type') != 'nn') or (summary.get('nn_evaluation_schema') != 1) or (info.get('research_only') is not True) or (info.get('automatic_promotion') is not False) or (info.get('evaluation_summary') != summary):
++        raise ValueError('NN package model/research/evaluation semantics differ')
++    unit = spec.get('target_unit')
++    if not isinstance(unit, str) or not unit.strip() or unit.strip() in {'target_units', 'target units'} or (info.get('target_unit') != unit) or (summary.get('target_unit') != unit):
++        raise ValueError('NN release target units differ')
++    if contract.get('schema_version') != 3 or contract.get('model_schema_stage') != 'pre_gold' or contract.get('gold_preprocessing') != 'owned_by_saved_model_adapter' or (contract.get('estimator_validation') != 'saved_nn_adapter_finite_arrays') or (contract.get('unseen_category_policy') != 'error'):
++        raise ValueError('NN release must retain strict pre-Gold input contract')
++
++def validate_destination(p, root):
++    from ml_template.paths import ARTIFACTS_RUNS
++    root = Path(root).resolve()
++    if any((root.is_relative_to(Path(source).resolve()) for source in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()])):
++        raise ValueError('NN release output cannot be inside source/run artifacts')
++    if any(((parent / name).is_file() for parent in [root, *root.parents] for name in ['manifest.json', 'artifact_manifest.json', 'artifacts.json', 'release.json'])):
++        raise ValueError('NN release output cannot be inside sealed artifacts')
++
++def compare_reference(reference, whole, chunked, single, key, columns, atol):
++    if isinstance(atol, bool) or not isinstance(atol, (float, int)) or (not np.isfinite(atol)) or (not 0 < atol <= 1e-05):
++        raise ValueError('Parity tolerance must be explicit, finite and at most 1e-5')
++    for frame in [reference, whole, chunked]:
++        if frame[key].isna().any() or frame[key].duplicated().any() or frame.empty:
++            raise ValueError('Parity keys must be nonempty, unique and nonmissing')
++        kinds = set()
++        for value in frame[key]:
++            if isinstance(value, np.generic):
++                value = value.item()
++            if isinstance(value, bool) or not isinstance(value, (int, str)):
++                raise ValueError('Parity keys must be integer or string')
++            kinds.add(type(value))
++        if len(kinds) != 1:
++            raise ValueError('Mixed parity key types')
++    r = reference.set_index(key).sort_index()
++    w = whole.set_index(key).sort_index()
++    c = chunked.set_index(key).sort_index()
++    if not r.index.equals(w.index) or not r.index.equals(c.index):
++        raise ValueError('Parity key coverage differs')
++    errors = {}
++    for source, destination in columns.items():
++        a = r[source].to_numpy()
++        b = w[destination].to_numpy()
++        z = c[destination].to_numpy()
++        if any((v.dtype.kind not in 'iuf' or not np.isfinite(v).all() for v in [a, b, z])):
++            raise ValueError('Parity requires finite real continuous values')
++        error = float(np.max(np.abs(a.astype(float) - b.astype(float))))
++        errors[destination] = error
++        chunk_error = float(np.max(np.abs(b.astype(float) - z.astype(float))))
++        if error > atol or chunk_error > atol:
++            raise ValueError(f'NN release parity failed: {destination}; reference_max_abs={error:.9g}; chunk_shuffle_max_abs={chunk_error:.9g}; atol={atol:.9g}')
++    if len(single) != 1 or single[key].iloc[0] != whole[key].iloc[0]:
++        raise ValueError('Singleton parity key differs')
++    for destination in columns.values():
++        value = single[destination].iloc[0]
++        target = whole[destination].iloc[0]
++        if isinstance(value, (bool, np.bool_)) or not np.isfinite(value) or abs(float(value) - float(target)) > atol:
++            raise ValueError('NN singleton parity failed')
++    return errors
++
++def check_parity(predictor, material, atol):
++    import pandas as pd
++    from ml_template.scoring.release_artifacts import sha256
++    from ml_template.evaluation.regression_postprocessing import reference_columns
++    p = material['prepared']
++    path = material['evaluation_dir'] / 'holdout_predictions.parquet'
++    if sha256(path) != material['reference_sha256']:
++        raise ValueError('Evaluation predictions changed')
++    extra = reference_columns(material)
++    wanted = list(dict.fromkeys([p.key_col, 'y_pred', 'y_pred_raw', *extra]))
++    reference = pd.read_parquet(path, columns=wanted)
++    if reference[p.key_col].isna().any() or reference[p.key_col].duplicated().any() or set(reference[p.key_col]) != set(p.hold_keys):
++        raise ValueError('NN parity reference population differs')
++    batch = material['source'].loc[reference[p.key_col]].reset_index()
++    whole = predictor.predict(batch)
++    chunked = predictor.predict(batch.iloc[::-1].reset_index(drop=True), chunk_size=max(1, min(137, len(batch) // 3)))
++    single = predictor.predict(batch.iloc[:1])
++    columns = {'y_pred_raw': 'y_pred_raw', 'y_pred': 'y_pred_release', **{name: name for name in extra if name != 'y_pred_raw'}}
++    errors = compare_reference(reference, whole, chunked, single, p.key_col, columns, atol)
++    if sha256(path) != material['reference_sha256']:
++        raise ValueError('Evaluation predictions changed during parity')
++    return {'n_rows': len(reference), 'atol': atol, 'max_abs_diff': max(errors.values()), 'column_max_abs_diff': errors, 'keyed': True, 'labels_loaded': False, 'metrics_recomputed': False, 'shuffled_chunk_parity': True, 'singleton_parity': True}
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--config', required=True, type=Path)
++    parser.add_argument('--database', type=Path)
++    parser.add_argument('--output-root', type=Path)
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument('--check', action='store_true')
++    mode.add_argument('--execute', action='store_true')
++    args = parser.parse_args(argv)
++    import yaml
++
++    class UniqueLoader(yaml.SafeLoader):
++        pass
++
++    def mapping(loader, node, deep=False):
++        out = {}
++        for a, b in node.value:
++            key = loader.construct_object(a, deep=deep)
++            if key in out:
++                raise ValueError('Duplicate NN release YAML key')
++            out[key] = loader.construct_object(b, deep=deep)
++        return out
++    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
++    from sqlalchemy import create_engine
++    from ml_template.paths import DATABASE
++    from ml_template.scoring.regression_release_config import RegressionReleaseConfig
++    from ml_template.scoring.release_builder import build_release
++    request = RegressionReleaseConfig.model_validate(yaml.load(args.config.read_text(), Loader=UniqueLoader))
++    path = (args.database if args.database is not None else DATABASE).expanduser().resolve()
++    if not path.is_file():
++        raise FileNotFoundError(path)
++    db_mode = 'ro' if args.check else 'rw'
++    engine = create_engine('sqlite://', creator=lambda: sqlite3.connect(path.as_uri() + '?mode=' + db_mode, uri=True))
++    try:
++        if not is_nn_parent(engine, request.parent_run_id):
++            raise ValueError('NN release CLI requires registered NN parent')
++        print(json.dumps(build_release(engine, request, check_only=args.check, output_root=args.output_root), indent=2, allow_nan=False))
++    finally:
++        engine.dispose()
++if __name__ == '__main__':
++    main()
+diff --git a/tests/scoring/test_nn_lifecycle_04.py b/tests/scoring/test_nn_lifecycle_04.py
+new file mode 100644
+--- /dev/null
++++ b/tests/scoring/test_nn_lifecycle_04.py
+@@ -0,0 +1,164 @@
++"""Pure NN release metadata and strict keyed parity tests."""
++import copy
++from types import SimpleNamespace
++import numpy as np
++import pandas as pd
++import pytest
++from ml_template.scoring.nn_release import neural_config, validate_packaged_nn, compare_reference
++
++def world():
++    cfg = SimpleNamespace(task='regression', model=SimpleNamespace(type='nn'), fitted_features=None)
++    summary = {'model_type': 'nn', 'nn_evaluation_schema': 1, 'target_unit': 'MPa'}
++    info = {'model_type': 'nn', 'research_only': True, 'automatic_promotion': False, 'target_unit': 'MPa', 'evaluation_summary': summary.copy()}
++    contract = {'schema_version': 3, 'model_schema_stage': 'pre_gold', 'gold_preprocessing': 'owned_by_saved_model_adapter', 'estimator_validation': 'saved_nn_adapter_finite_arrays', 'unseen_category_policy': 'error'}
++    descriptor = {'schema_version': 3, 'model_type': 'nn', 'serialization': {'format': 'torch', 'weights_only': True, 'checkpoint_version': 1, 'preprocessing': 'embedded'}}
++    evidence = {'evaluation_spec': {'target_unit': 'MPa'}, 'evaluation_summary': summary}
++    return (cfg, info, contract, descriptor, evidence)
++
++def test_valid_packaged_metadata():
++    validate_packaged_nn(*world())
++
++@pytest.mark.parametrize('kind', ['model', 'units', 'summary', 'promotion', 'research', 'owner', 'stage', 'finite', 'category', 'descriptor', 'external_fitted'])
++def test_bad_packaged_metadata(kind):
++    cfg, info, contract, d, e = world()
++    if kind == 'model':
++        info['model_type'] = 'xgb'
++    elif kind == 'units':
++        info['target_unit'] = 'wrong'
++    elif kind == 'summary':
++        info['evaluation_summary'] = {'wrong': True}
++    elif kind == 'promotion':
++        info['automatic_promotion'] = True
++    elif kind == 'research':
++        info['research_only'] = False
++    elif kind == 'owner':
++        contract['gold_preprocessing'] = 'global'
++    elif kind == 'stage':
++        contract['model_schema_stage'] = 'post_gold'
++    elif kind == 'finite':
++        contract['estimator_validation'] = 'not wired'
++    elif kind == 'category':
++        contract['unseen_category_policy'] = 'allow_all'
++    elif kind == 'descriptor':
++        d['schema_version'] = 2
++    else:
++        cfg.fitted_features = [{'step': 'other'}]
++    with pytest.raises(ValueError):
++        validate_packaged_nn(cfg, info, contract, d, e)
++
++def test_legacy_xgb_metadata_unchanged():
++    cfg, info, contract, d, e = world()
++    cfg.model.type = 'xgb'
++    info = {}
++    d = {}
++    validate_packaged_nn(cfg, info, contract, d, e)
++
++@pytest.mark.parametrize('cfg', [None, SimpleNamespace(task='regression'), SimpleNamespace(task='binary_classification', model=SimpleNamespace(type='nn'))])
++def test_lightweight_legacy_config_not_misrouted(cfg):
++    assert not neural_config(cfg)
++
++def parity():
++    reference = pd.DataFrame({'id': [3, 1, 2], 'raw': [-1.0, 2.0, 3.0], 'point': [0.0, 3.0, 4.0], 'lower': [-2.0, 1.0, 2.0], 'upper': [2.0, 5.0, 6.0]})
++    whole = reference.rename(columns={'raw': 'y_pred_raw', 'point': 'y_pred_release'}).copy()
++    return (reference, whole, whole.iloc[::-1].copy(), whole.iloc[:1].copy(), {'raw': 'y_pred_raw', 'point': 'y_pred_release', 'lower': 'lower', 'upper': 'upper'})
++
++def test_keyed_shuffled_and_negative_parity():
++    ref, whole, chunk, single, columns = parity()
++    assert all((v == 0 for v in compare_reference(ref, whole, chunk, single, 'id', columns, 1e-06).values()))
++
++@pytest.mark.parametrize('tol', [True, 0.0, -1.0, np.inf, np.nan, 0.0001])
++def test_invalid_tolerances(tol):
++    a, b, c, d, cols = parity()
++    with pytest.raises(ValueError):
++        compare_reference(a, b, c, d, 'id', cols, tol)
++
++@pytest.mark.parametrize('kind', ['missing', 'duplicate', 'null_key', 'float_key', 'raw', 'point', 'interval', 'chunk', 'singleton', 'singleton_key', 'nonfinite', 'boolean'])
++def test_parity_failures(kind):
++    ref, whole, chunk, single, columns = parity()
++    if kind == 'missing':
++        whole = whole.iloc[:-1]
++    elif kind == 'duplicate':
++        whole.loc[1, 'id'] = 3
++    elif kind == 'null_key':
++        whole.loc[0, 'id'] = np.nan
++    elif kind == 'float_key':
++        whole['id'] = whole.id.astype(float)
++    elif kind == 'raw':
++        whole.loc[0, 'y_pred_raw'] += 0.1
++    elif kind == 'point':
++        whole.loc[0, 'y_pred_release'] += 0.1
++    elif kind == 'interval':
++        whole.loc[0, 'lower'] -= 0.1
++    elif kind == 'chunk':
++        chunk.loc[0, 'y_pred_release'] += 0.1
++    elif kind == 'singleton':
++        single.loc[single.index[0], 'y_pred_release'] += 0.1
++    elif kind == 'singleton_key':
++        single.loc[single.index[0], 'id'] = 99
++    elif kind == 'nonfinite':
++        whole.loc[0, 'y_pred_raw'] = np.inf
++    else:
++        whole['y_pred_raw'] = True
++    with pytest.raises(ValueError):
++        compare_reference(ref, whole, chunk, single, 'id', columns, 1e-06)
++
++def test_explicit_small_float32_roundoff_allowed():
++    a, b, c, d, cols = parity()
++    b['y_pred_release'] += 1e-07
++    c['y_pred_release'] += 1e-07
++    d['y_pred_release'] += 1e-07
++    compare_reference(a, b, c, d, 'id', cols, 1e-06)
++
++def test_inputs_not_mutated_by_parity():
++    a, b, c, d, cols = parity()
++    before = [frame.copy(deep=True) for frame in [a, b, c, d]]
++    compare_reference(a, b, c, d, 'id', cols, 1e-06)
++    for original, frame in zip(before, [a, b, c, d], strict=True):
++        pd.testing.assert_frame_equal(original, frame)
++
++@pytest.mark.parametrize('kind', ['valid', 'tamper_before', 'tamper_during'])
++def test_reference_projection_and_tamper_guards(tmp_path, monkeypatch, kind):
++    import hashlib
++    import sys
++    import types
++    from ml_template.scoring.nn_release import check_parity
++    ref, whole, _, _, _ = parity()
++    ref = ref.rename(columns={'raw': 'y_pred_raw', 'point': 'y_pred'})
++    path = tmp_path / 'holdout_predictions.parquet'
++    path.write_bytes(b'reference fixture')
++    expected = hashlib.sha256(path.read_bytes()).hexdigest()
++    module = types.ModuleType('ml_template.scoring.release_artifacts')
++    module.sha256 = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
++    monkeypatch.setitem(sys.modules, 'ml_template.scoring.release_artifacts', module)
++    post = types.ModuleType('ml_template.evaluation.regression_postprocessing')
++    post.reference_columns = lambda material: ['y_pred_raw', 'lower', 'upper']
++    monkeypatch.setitem(sys.modules, 'ml_template.evaluation.regression_postprocessing', post)
++    reads = []
++    predicted = []
++
++    def read(candidate, columns):
++        assert candidate == path and 'y_true' not in columns and ('y_pred_raw' in columns)
++        reads.append(columns)
++        return ref[columns].copy()
++    monkeypatch.setattr(pd, 'read_parquet', read)
++
++    class Predictor:
++
++        def predict(self, batch, **kwargs):
++            predicted.append(batch.id.tolist())
++            if kind == 'tamper_during':
++                path.write_bytes(b'changed during parity')
++            return whole.set_index('id').loc[batch.id].reset_index()
++    source = pd.DataFrame({'id': ref.id, 'x': 0.0}).set_index('id')
++    material = {'prepared': SimpleNamespace(key_col='id', hold_keys=ref.id.tolist()), 'evaluation_dir': tmp_path, 'reference_sha256': expected, 'source': source}
++    if kind == 'tamper_before':
++        path.write_bytes(b'changed before parity')
++    if kind == 'valid':
++        result = check_parity(Predictor(), material, 1e-06)
++        assert result['max_abs_diff'] == 0 and result['labels_loaded'] is False and (result['metrics_recomputed'] is False)
++        assert len(predicted) == 3
++    else:
++        with pytest.raises(ValueError):
++            check_parity(Predictor(), material, 1e-06)
++        if kind == 'tamper_before':
++            assert not reads and (not predicted)
+diff --git a/tests/scoring/test_nn_lifecycle_04_native.py b/tests/scoring/test_nn_lifecycle_04_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/scoring/test_nn_lifecycle_04_native.py
+@@ -0,0 +1,114 @@
++"""Real synthetic CPU NN evaluate -> sealed release -> registry-free offline predict."""
++import importlib.util
++import shutil
++import sys
++from pathlib import Path
++import numpy as np
++import pandas as pd
++import pytest
++_path = Path(__file__).parents[1] / 'models' / 'test_nn_lifecycle_01_native.py'
++_spec = importlib.util.spec_from_file_location('nn_package_04_training_fixture', _path)
++_module = importlib.util.module_from_spec(_spec)
++sys.modules[_spec.name] = _module
++_spec.loader.exec_module(_module)
++trained = _module.trained
++
++@pytest.fixture(autouse=True)
++def _fixed_synthetic_inference_microbatch(monkeypatch):
++    import copy
++    from ml_template.training.run_config import RunConfig
++    original = RunConfig.model_validate
++
++    def fixed(cls, raw, **kwargs):
++        if isinstance(raw, dict) and raw.get('experiment_name') == 'nn_package_01':
++            raw = copy.deepcopy(raw)
++            raw['model']['params']['prediction_batch_size'] = 1
++        return original(raw, **kwargs)
++    monkeypatch.setattr(RunConfig, 'model_validate', classmethod(fixed))
++
++@pytest.mark.parametrize('kind', ['final', 'cv_mean'])
++@pytest.mark.parametrize('variant', ['raw', 'intervals', 'bias', 'affine'])
++def test_native_nn_release_offline(trained, tmp_path, monkeypatch, kind, variant):
++    from ml_template.evaluation.evaluate_run import evaluate_spec
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.training.regression_calibration import CalibrationConfig, calibrate
++    from ml_template.scoring.regression_release_config import RegressionReleaseConfig
++    from ml_template.scoring.release_builder import build_release
++    from ml_template.scoring.predictor import ReleasedPredictor
++    from ml_template.models.nn_regressor import NNRegressionAdapter
++    from ml_template.preprocessing.nn_preprocessor import NNPreprocessor
++    correction = variant if variant in ['bias', 'affine'] else 'none'
++    stage = {'value': 'calibrate'}
++    old_read = pd.read_parquet
++    package_reads = []
++
++    def spy(path, *args, **kwargs):
++        path = Path(path)
++        if stage['value'] == 'package':
++            if path == trained['parquet']:
++                columns = kwargs.get('columns')
++                assert columns is not None and 'y' not in columns and ('y_true' not in columns)
++                package_reads.append(tuple(columns))
++            if path.name == 'holdout_predictions.parquet':
++                assert kwargs.get('columns') is not None and 'y_true' not in kwargs['columns']
++        elif stage['value'] == 'offline':
++            if path == trained['parquet'] or path.name == 'holdout_predictions.parquet':
++                pytest.fail('offline inference opened historical data/evaluation rows')
++        return old_read(path, *args, **kwargs)
++    monkeypatch.setattr(pd, 'read_parquet', spy)
++    monkeypatch.setattr(NNPreprocessor, 'fit', lambda *a, **k: pytest.fail('release fitted Gold'))
++    monkeypatch.setattr(NNRegressionAdapter, '_train', lambda *a, **k: pytest.fail('release trained NN'))
++    calibration_id = None
++    if variant != 'raw':
++        c = calibrate(trained['engine'], CalibrationConfig(model_type='nn', parent_run_id=trained['rid'], predictor_kind=kind, correction=correction, coverages=[0.5, 0.8], target_unit='synthetic_units', min_calibration_rows=5, min_recalibration_rows=3, intended_use='Synthetic only'), output_root=tmp_path / 'calibrations', check_only=False, **trained['roots'])
++        calibration_id = c['calibration_id']
++    stage['value'] = 'evaluate'
++    eval_spec = RegressionEvaluationConfig(parent_run_id=trained['rid'], predictor={'kind': kind}, calibration_id=calibration_id, target_unit='synthetic_units', release_variant='recalibrated' if correction != 'none' else 'raw', uncertainty={'enabled': variant != 'raw', 'coverages': [0.8] if variant != 'raw' else []})
++    evaluated = evaluate_spec(trained['engine'], eval_spec, output_root=tmp_path / 'evaluations', **trained['roots'])
++    request = RegressionReleaseConfig(name='synthetic_nn', parent_run_id=trained['rid'], evaluation_id=evaluated['evaluation_id'], calibration_id=calibration_id, intended_use='Synthetic research only', acknowledge_research_release=True, parity_atol=1e-06)
++    stage['value'] = 'package'
++    old_load = trained['torch'].load
++    monkeypatch.setattr(trained['torch'], 'load', lambda *a, **k: pytest.fail('release check loaded checkpoint'))
++    output = tmp_path / 'releases'
++    check = build_release(trained['engine'], request, check_only=True, output_root=output)
++    assert check['ready'] and (not check['models_loaded']) and check['source_features_loaded'] and (not check['labels_loaded'])
++    assert not check['parity_executed'] and (not output.exists())
++    monkeypatch.setattr(trained['torch'], 'load', old_load)
++    released = build_release(trained['engine'], request, output_root=output)
++    assert released['status'] == 'succeeded' and (not released['holdout_labels_loaded'])
++    assert released['parity']['labels_loaded'] is False and released['parity']['metrics_recomputed'] is False
++    assert released['parity']['max_abs_diff'] <= 1e-06 and package_reads
++    directory = Path(released['artifact_dir'])
++    moved = []
++    for source in [trained['roots']['silver_root'], trained['roots']['feature_root'], trained['roots']['split_root'], trained['root'], Path(trained['cfg'].data.dataset_config)]:
++        target = source.with_name(source.name + '_offline')
++        shutil.move(str(source), str(target))
++        moved.append((source, target))
++    stage['value'] = 'offline'
++    try:
++        from ml_template.db import evaluation_registry, model_run_registry
++        with monkeypatch.context() as isolated:
++            isolated.setattr(evaluation_registry, 'connection', lambda *a, **k: pytest.fail('offline accessed registry'))
++            isolated.setattr(model_run_registry, 'get_run', lambda *a, **k: pytest.fail('offline looked up training run'))
++            predictor = ReleasedPredictor(directory, expected_release_id=released['release_id'])
++            new = pd.DataFrame({'id': [9001, 9002, 9003, 9004], 'a': [1.1, 2.2, np.nan, 3.3], 'b': [2.0, np.nan, 3.0, 1.0], 'k': ['u', 'v', None, 'u']})
++            whole = predictor.predict(new)
++            shuffled = predictor.predict(new.iloc[::-1], chunk_size=1).set_index('id').sort_index()
++            baseline = whole.set_index('id').sort_index()
++            columns = [c for c in baseline if c not in ['release_id']]
++            np.testing.assert_allclose(baseline[columns], shuffled[columns], rtol=0, atol=1e-06)
++            assert np.isfinite(baseline[columns].to_numpy()).all()
++            assert predictor.info['model_type'] == 'nn' and predictor.info['target_unit'] == 'synthetic_units'
++            with pytest.raises(ValueError):
++                predictor.predict(new.assign(y=0.0))
++            unknown = new.copy()
++            unknown.loc[0, 'k'] = 'unseen'
++            with pytest.raises(ValueError):
++                predictor.predict(unknown)
++    finally:
++        for source, target in reversed(moved):
++            shutil.move(str(target), str(source))
++    (directory / 'model.ubj' if kind == 'final' else directory / 'fold_models/fold_0.ubj').write_bytes(b'tampered')
++    monkeypatch.setattr(trained['torch'], 'load', lambda *a, **k: pytest.fail('tampered release deserialized'))
++    with pytest.raises(ValueError):
++        ReleasedPredictor(directory, expected_release_id=released['release_id'])
+diff --git a/configs/release/concrete_nn_package_04.example.yaml b/configs/release/concrete_nn_package_04.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/release/concrete_nn_package_04.example.yaml
+@@ -0,0 +1,11 @@
++# Replace with the actual successful Package 03 ID; never create a new evaluation to debug packaging.
++schema_version: 2
++task: regression
++name: concrete_nn_research
++parent_run_id: run_20261111_135508_ccf0e8
++evaluation_id: eval_REPLACE_WITH_PACKAGE03_ID
++# Must exactly match the evaluation: null for uncalibrated; actual regcal_... otherwise.
++calibration_id: null
++intended_use: "Exploratory NN research release; not independent deployment approval"
++acknowledge_research_release: false
++parity_atol: 0.000001

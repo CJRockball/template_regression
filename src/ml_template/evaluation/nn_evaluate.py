@@ -69,19 +69,17 @@ def exposure_warnings(engine, p):
         )
     ]
     result.extend(
-
-            {
-                "source": "legacy_or_parent_timestamp",
-                "run_id": r["run_id"],
-                "accessed_at": r["holdout_evaluated_at"],
-            }
-            for r in rows(
-                engine,
-                "model_runs",
-                "SELECT run_id,holdout_evaluated_at FROM model_runs WHERE silver_dataset_version_id=? AND holdout_evaluated_at IS NOT NULL ORDER BY started_at DESC",
-                (silver,),
-            )
-
+        {
+            "source": "legacy_or_parent_timestamp",
+            "run_id": r["run_id"],
+            "accessed_at": r["holdout_evaluated_at"],
+        }
+        for r in rows(
+            engine,
+            "model_runs",
+            "SELECT run_id,holdout_evaluated_at FROM model_runs WHERE silver_dataset_version_id=? AND holdout_evaluated_at IS NOT NULL ORDER BY started_at DESC",
+            (silver,),
+        )
     )
     return result
 
@@ -186,23 +184,19 @@ def validate_output(p, root):
 
     root = Path(root).resolve()
     if any(
-
-            root.is_relative_to(Path(v).resolve())
-            for v in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()]
-
+        root.is_relative_to(Path(v).resolve())
+        for v in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()]
     ):
         raise ValueError("NN output cannot be inside source/run artifacts")
     if any(
-
-            (parent / name).is_file()
-            for parent in [root, *root.parents]
-            for name in [
-                "artifact_manifest.json",
-                "manifest.json",
-                "artifacts.json",
-                "release.json",
-            ]
-
+        (parent / name).is_file()
+        for parent in [root, *root.parents]
+        for name in [
+            "artifact_manifest.json",
+            "manifest.json",
+            "artifacts.json",
+            "release.json",
+        ]
     ):
         raise ValueError("NN output cannot be inside sealed artifacts")
 

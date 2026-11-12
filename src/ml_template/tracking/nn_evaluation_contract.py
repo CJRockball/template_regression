@@ -298,12 +298,8 @@ def validate_report(data, record, stored):
         or set(d["training_rows"]) != model_names
         or any(type(v) is not int or v < 1 for v in d["training_rows"].values())
         or any(
-
-                not isinstance(v, str)
-                or len(v) != 64
-                or any(c not in "0123456789abcdef" for c in v)
-                for v in d["files_sha256"].values()
-
+            not isinstance(v, str) or len(v) != 64 or any(c not in "0123456789abcdef" for c in v)
+            for v in d["files_sha256"].values()
         )
     ):
         raise ValueError("NN hash/fit-row coverage differs")
