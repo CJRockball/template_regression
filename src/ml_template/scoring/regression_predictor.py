@@ -7,7 +7,7 @@ import pandas as pd
 
 from ml_template.evaluation.evaluation_config import PolicyConfig
 from ml_template.models.regression_predictor import continuous
-from ml_template.scoring.input_contract import coerce_frame, validate_batch
+from ml_template.scoring.input_contract import validate_batch
 from ml_template.scoring.pre_gold_schema import get_preprocessor_schema
 from ml_template.scoring.release_artifacts import read_json, sha256, verify, verify_runtime
 
@@ -25,8 +25,8 @@ class RegressionReleasedPredictor:
             or self.info.get("prediction_kind") != "continuous"
         ):
             raise ValueError("Unsupported regression release semantics")
-        if self.info["calibration_id"] is not None or self.info["release_variant"] != "raw":
-            raise ValueError("Regression release must be uncalibrated")
+        if self.info["release_variant"] not in {"raw", "recalibrated"}:
+            raise ValueError("unsupported regression point variant")
         self.policy = PolicyConfig.model_validate(self.info["policy"])
         if self.policy.kind != "none":
             raise ValueError("Classification policy is invalid for regression")
@@ -34,25 +34,18 @@ class RegressionReleasedPredictor:
         self.contract = read_json(self.directory / "contract.json")
         self.recipe = read_json(self.directory / "feature_recipe.json")
         self.preprocessor_input_schema = get_preprocessor_schema(self.contract)
-        names = [item["name"] for item in self.contract["source_schema"]]
-        if self.recipe != {
-            "schema_version": 1,
-            "kind": "identity",
-            "raw_columns": names,
-            "columns": names,
-        }:
-            raise ValueError("Only raw identity regression features are supported")
-        if names != [item["name"] for item in self.preprocessor_input_schema]:
-            raise ValueError("Regression input schema order differs")
         from ml_template.models.predictor_selection import load_selected_predictor
         from ml_template.training.run_config import RunConfig
 
         cfg = RunConfig.model_validate(read_json(self.directory / "config.json"))
-        if cfg.task != "regression" or cfg.fitted_features or cfg.data.feature_set_id:
-            raise ValueError("Unsupported regression feature recipe")
+        if cfg.task != "regression":
+            raise ValueError("Expected regression release config")
+        from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+        validate_regression_specs(cfg.fitted_features)
         descriptor = read_json(self.directory / "predictor.json")
         evidence = read_json(self.directory / "evidence.json")
-        provenance, spec = evidence["provenance"], evidence["evaluation_spec"]
+        provenance, spec = (evidence["provenance"], evidence["evaluation_spec"])
         if (
             descriptor != provenance["predictor"]
             or descriptor["kind"] != self.info["predictor_kind"]
@@ -68,6 +61,8 @@ class RegressionReleasedPredictor:
         if (
             summary["evaluation_id"] != self.info["evaluation_id"]
             or summary["parent_run_id"] != self.info["parent_run_id"]
+            or summary.get("calibration_id") != self.info["calibration_id"]
+            or summary.get("release_variant") != self.info["release_variant"]
         ):
             raise ValueError("Release summary identity differs")
         from ml_template.evaluation.evaluation_inputs import digest
@@ -80,10 +75,30 @@ class RegressionReleasedPredictor:
         outputs = {"raw": "y_pred_raw", "release": "y_pred_release"}
         if self.info.get("prediction_columns") != outputs:
             raise ValueError("Unexpected regression output schema")
+        from ml_template.features.prepared_recipe import validate_packaged
+
+        feature_info = None
+        if "features.json" in self.manifest["files"]:
+            if sha256(self.directory / "features.json") != provenance["input_hashes"]["features"]:
+                raise ValueError("Packaged feature metadata differs from evaluated input schema")
+            feature_info = read_json(self.directory / "features.json")
+        self.recipe = validate_packaged(
+            self.recipe,
+            self.contract,
+            self.preprocessor_input_schema,
+            cfg,
+            provenance,
+            feature_info,
+        )
+        from ml_template.evaluation.regression_postprocessing import load_packaged
+
+        self.postprocessing = load_packaged(self.directory, self.info, provenance, spec)
         self.model = load_selected_predictor(cfg, self.directory, descriptor)
 
     def _prepare_source_features(self, source):
-        return coerce_frame(source, self.preprocessor_input_schema)
+        from ml_template.features.prepared_recipe import prepare_frame
+
+        return prepare_frame(source, self.recipe, self.preprocessor_input_schema)
 
     def prepare_features(self, frame):
         return self._prepare_source_features(validate_batch(frame, self.contract))
@@ -100,7 +115,7 @@ class RegressionReleasedPredictor:
             features = self._prepare_source_features(raw.iloc[start : start + chunk_size])
             pieces.append(continuous(self.model.predict(features), len(features)))
         values = continuous(np.concatenate(pieces), len(raw))
-        return pd.DataFrame(
+        result = pd.DataFrame(
             {
                 self.contract["key_col"]: raw.index.to_numpy(),
                 "y_pred_raw": values,
@@ -108,3 +123,6 @@ class RegressionReleasedPredictor:
                 "release_id": self.release_id,
             }
         )
+        from ml_template.evaluation.regression_postprocessing import add_predictions
+
+        return add_predictions(result, self.postprocessing)

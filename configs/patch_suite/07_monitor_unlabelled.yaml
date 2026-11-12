@@ -1,0 +1,18 @@
+# Replace the example fixed as_of cutoff with your intended timezone-aware observation cutoff. No labels means no outcome/coverage claim.
+schema_version: 1
+scoring_batch_id: score_20261111_115423_cc302c961409
+reference_id: ref_20261111_120409_90d029c94d2b
+label_import_id: null
+as_of: '2026-11-11T00:00:00Z'
+target_unit: MPa
+min_rows: 200
+min_labelled: 100
+min_label_coverage: 0.9
+js_warning: 0.1
+rmse_warning: null
+mae_warning: null
+abs_bias_warning: null
+missing_rate_warning: 1.0
+missing_rate_delta_warning: 0.1
+interval_coverage_slack: 0.05
+quality_ranges: {}

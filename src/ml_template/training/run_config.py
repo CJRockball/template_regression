@@ -28,10 +28,17 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from ml_template.evaluation.metrics import resolved_keys, with_standard
-from ml_template.models.nn.params import NNModelConfig
+from ml_template.models.nn.params import NNModelConfig, NNRegressionParams
 from ml_template.paths import ROOT
 
 SCHEMA_VERSION = 2
@@ -63,6 +70,27 @@ class SplitConfig(_Strict):
     # Controls development-fold assignments only.
     # None preserves the original behavior and split identity.
     cv_seed: int | None = None
+    calibration_fraction: float = Field(default=0.0, ge=0, lt=1, allow_inf_nan=False)
+    recalibration_fraction: float = Field(default=0.0, ge=0, lt=1, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _reserved_roles(self):
+        if (self.calibration_fraction or self.recalibration_fraction) and (
+            self.method != "random"
+            or self.holdout_fraction + self.calibration_fraction + self.recalibration_fraction >= 1
+        ):
+            raise ValueError(
+                "reserved calibration roles require random splitting and positive development share"
+            )
+        return self
+
+    @model_serializer(mode="wrap")
+    def _legacy_serialization(self, handler):
+        data = handler(self)
+        for name in ("calibration_fraction", "recalibration_fraction"):
+            if data.get(name) == 0:
+                data.pop(name, None)
+        return data
 
 
 class TrainingConfig(_Strict):
@@ -231,13 +259,17 @@ class RunConfig(_Strict):
             data = copy.deepcopy(data)
             data["metrics"] = RegressionMetricsConfig.model_validate(data.get("metrics", {}))
             raw_model = data.get("model", {})
+            if isinstance(raw_model, dict) and raw_model.get("type") == "nn":
+                params = raw_model.setdefault("params", {})
+                if isinstance(params, dict):
+                    params.setdefault("task", "regression")
             raw_params = (
                 raw_model.get("params", {}) if isinstance(raw_model, dict) else raw_model.params
             )
             monitor = (
-                raw_params.get("eval_metric", "rmse")
+                raw_params.get("eval_metric", raw_params.get("monitor", "rmse"))
                 if isinstance(raw_params, dict)
-                else raw_params.eval_metric
+                else getattr(raw_params, "eval_metric", getattr(raw_params, "monitor", "rmse"))
             )
             analysis = {
                 "permutation_importance": False,
@@ -258,16 +290,23 @@ class RunConfig(_Strict):
     def _task_compatibility(self):
         regression = self.task == "regression"
         if regression:
-            if self.model.type != "xgb" or not isinstance(self.model.params, XGBRegressionParams):
-                raise ValueError("Regression currently requires xgb with reg:squarederror")
+            xgb = self.model.type == "xgb" and isinstance(self.model.params, XGBRegressionParams)
+            neural = self.model.type == "nn" and isinstance(self.model.params, NNRegressionParams)
+            if not (xgb or neural):
+                raise ValueError(
+                    "Regression requires XGB regression parameters or NN regression parameters"
+                )
+            if neural and self.fitted_features:
+                raise ValueError("NN regression owns preprocessing; leave fitted_features unset")
             if self.split.method != "random":
                 raise ValueError("Regression requires split.method: random")
             if not isinstance(self.metrics, RegressionMetricsConfig):
                 raise ValueError("Regression requires regression metrics")
             if self.metrics.primary == "r2":
                 raise ValueError("Use rmse or mae as the initial primary metric; r2 is diagnostic")
-            if self.fitted_features:
-                raise ValueError("Regression fitted_features are not supported in this first patch")
+            from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+            validate_regression_specs(self.fitted_features)
             if self.analysis.permutation_importance or self.analysis.error_sample_size:
                 raise ValueError("Regression analyses are not implemented; disable them")
         else:
@@ -275,6 +314,8 @@ class RunConfig(_Strict):
                 raise ValueError("Binary tasks require classification metrics")
             if self.model.type == "xgb" and isinstance(self.model.params, XGBRegressionParams):
                 raise ValueError("Regression objective requires task: regression")
+            if self.model.type == "nn" and isinstance(self.model.params, NNRegressionParams):
+                raise ValueError("NN regression parameters require task: regression")
             if self.split.method != "stratified":
                 raise ValueError("Binary task requires stratified splits")
         return self

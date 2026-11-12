@@ -1,0 +1,8 @@
+schema_version: 1
+scoring_batch_id: REPLACE_CURRENT_SCORE_BATCH_ID
+input_path: REPLACE_WITH_COMPLETE_KEYED_OUTCOME_SNAPSHOT.parquet
+source: Describe outcome collection
+outcome_definition: Describe the continuous outcome and measurement horizon
+sampling: all_rows
+target_unit: target_units
+supersedes_label_import_id: null

@@ -20,6 +20,10 @@ class BatchView:
     artifact_hashes: dict
 
     @property
+    def task(self):
+        return self.summary.get("task", "binary_classification")
+
+    @property
     def key(self):
         return self.contract["key_col"]
 
@@ -60,8 +64,15 @@ def load_batch(engine, batch_id):
     if len(snapshots) != 1:
         raise ValueError("exactly one canonical input snapshot is required")
     summary = read_json(safe_path(directory, "summary.json"))
-    if summary.get("schema_version") != 1:
-        raise ValueError("unsupported score summary schema")
+    task = info.get("task", "binary_classification")
+    if task not in {"binary_classification", "regression"}:
+        raise ValueError("unsupported monitoring task")
+    regression = task == "regression"
+    if (
+        summary.get("schema_version") != (2 if regression else 1)
+        or summary.get("task", "binary_classification") != task
+    ):
+        raise ValueError("unsupported score summary task/schema")
     for name in ("scoring_batch_id", "release_id", "n_rows", "n_flagged", "input_sha256"):
         if summary.get(name) != record[name]:
             raise ValueError(f"summary/registry mismatch: {name}")
@@ -80,7 +91,8 @@ def load_batch(engine, batch_id):
     )
     validate_batch(source, contract)
     predictions = pd.read_parquet(directory / "predictions.parquet")
-    required = {key, "p_raw", "p_release", "release_id", "scoring_batch_id"}
+    score_columns = {"y_pred_raw", "y_pred_release"} if regression else {"p_raw", "p_release"}
+    required = {key, "release_id", "scoring_batch_id", *score_columns}
     if predictions.columns.duplicated().any() or not required <= set(predictions.columns):
         raise ValueError("invalid prediction columns")
     if len(predictions) != len(source) or len(source) != record["n_rows"]:
@@ -98,6 +110,16 @@ def load_batch(engine, batch_id):
     for column, expected in (("release_id", record["release_id"]), ("scoring_batch_id", batch_id)):
         if not predictions[column].eq(expected).all():
             raise ValueError(f"prediction identity mismatch: {column}")
+    if regression:
+        from ml_template.monitoring.regression import validate_predictions
+
+        validate_predictions(predictions, summary, info)
+        predictions = predictions.set_index(key).loc[source[key]].reset_index()
+        hashes = {name: item["sha256"] for name, item in entries.items()}
+        hashes["artifacts.json"] = digest(directory / "artifacts.json")
+        return BatchView(
+            record, summary, contract, source.reset_index(drop=True), predictions, hashes
+        )
     for column in ("p_raw", "p_calibrated", "p_release"):
         if column in predictions:
             values = predictions[column].to_numpy(dtype=float)

@@ -29,7 +29,14 @@ def global_payload(database, explanation_id, *, max_rows=100000):
     table = view.rows[
         [
             name
-            for name in ("p_raw", "p_calibrated", "p_release", "policy_flag")
+            for name in (
+                "p_raw",
+                "p_calibrated",
+                "p_release",
+                "policy_flag",
+                "y_pred_raw",
+                "y_pred_release",
+            )
             if name in view.rows
         ]
     ].copy()
@@ -53,7 +60,14 @@ def local_payload(database, explanation_id, position, *, max_rows=100000):
     key, row, table = selected_entity(view, position)
     scores = {
         name: str(row[name])
-        for name in ("p_raw", "p_calibrated", "p_release", "policy_flag")
+        for name in (
+            "p_raw",
+            "p_calibrated",
+            "p_release",
+            "policy_flag",
+            "y_pred_raw",
+            "y_pred_release",
+        )
         if name in row.index
     }
     return (
@@ -105,7 +119,7 @@ def create_app(database, *, max_rows=100000):
                 ),
                 html.Pre(id="usage-summary"),
                 html.P(
-                    "Contributions explain base-model log-odds, not calibrated probabilities or causes. All global figures describe the complete scoring batch. The entity table can be filtered without changing global figures or the original policy."
+                    "Classification contributions explain base-model log-odds, not calibrated probabilities. Regression contributions explain continuous predictions in the declared target units. Neither establishes causes. Global figures describe the complete scoring batch. CV inputs that vary across fitted transforms are explicitly marked; their dependence plots are disabled."
                 ),
                 dcc.Graph(id="usage-importance"),
                 dcc.Graph(id="usage-distribution"),

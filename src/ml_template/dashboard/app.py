@@ -15,6 +15,7 @@ from ml_template.dashboard.pages import (
     run_page,
     sweeps_page,
 )
+from ml_template.dashboard.report_callbacks import export_toolbar, register_exports
 
 
 def create_app(engine=None):
@@ -36,6 +37,7 @@ def create_app(engine=None):
     def layout():
         return html.Div(
             [
+                export_toolbar(),
                 dcc.Tabs(
                     id="dashboard-tab",
                     value="run",
@@ -58,6 +60,7 @@ def create_app(engine=None):
     app.layout = layout
     for _value, _label, _container, page in pages:
         page.register_callbacks(app, engine)
+    register_exports(app)
 
     @app.callback(
         *[Output(container, "style") for _value, _label, container, _page in pages],

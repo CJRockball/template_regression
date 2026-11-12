@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
@@ -10,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_v
 class ExplanationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: StrictInt = 1
+    task: Literal["binary_classification", "regression"] = "binary_classification"
+    target_unit: StrictStr | None = None
+    prediction_atol: float = Field(default=1e-5, ge=0, allow_inf_nan=False)
+    prediction_rtol: float = Field(default=1e-5, ge=0, allow_inf_nan=False)
     release_dir: StrictStr
     scoring_dir: StrictStr
     expected_release_id: StrictStr

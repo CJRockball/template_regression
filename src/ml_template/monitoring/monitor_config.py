@@ -18,6 +18,7 @@ class ReferenceConfig(StrictRequest):
     name: str = Field(min_length=1)
     approved_population: str = Field(min_length=1)
     numeric_bins: int = Field(default=10, ge=2, le=50)
+    target_unit: str | None = Field(default=None, min_length=1)
 
 
 class LabelConfig(StrictRequest):
@@ -27,6 +28,7 @@ class LabelConfig(StrictRequest):
     outcome_definition: str = Field(min_length=1)
     sampling: Literal["all_rows", "selected", "unknown"]
     supersedes_label_import_id: str | None = None
+    target_unit: str | None = Field(default=None, min_length=1)
 
 
 class MonitorConfig(StrictRequest):
@@ -43,6 +45,13 @@ class MonitorConfig(StrictRequest):
     brier_warning: float | None = Field(default=None, ge=0, le=1)
     recall_floor: float | None = Field(default=None, ge=0, le=1)
     quality_ranges: dict[str, tuple[float, float]] = Field(default_factory=dict)
+    target_unit: str | None = Field(default=None, min_length=1)
+    rmse_warning: float | None = Field(default=None, ge=0)
+    mae_warning: float | None = Field(default=None, ge=0)
+    abs_bias_warning: float | None = Field(default=None, ge=0)
+    missing_rate_warning: float = Field(default=1.0, ge=0, le=1)
+    missing_rate_delta_warning: float = Field(default=0.1, ge=0, le=1)
+    interval_coverage_slack: float = Field(default=0.05, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_options(self):

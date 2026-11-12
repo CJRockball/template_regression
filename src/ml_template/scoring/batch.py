@@ -65,6 +65,8 @@ def _score_batch(
     if check_only:
         before = sha256(input_path)
         frame = read_batch(input_path, predictor.contract)
+        if (getattr(predictor, "info", None) or {}).get("task") == "regression":
+            predictor.prepare_features(frame)
         if sha256(input_path) != before:
             raise ValueError("input changed during preflight")
         return {
@@ -74,6 +76,11 @@ def _score_batch(
             "input_sha256": before,
             "files_written": False,
             "predictions_computed": False,
+            **(
+                {"stateless_recipe_checked": True}
+                if (getattr(predictor, "info", None) or {}).get("task") == "regression"
+                else {}
+            ),
         }
     from ml_template.db import scoring_registry as registry
     from ml_template.paths import ARTIFACTS, LOGS
@@ -137,6 +144,12 @@ def _score_batch(
                     task="regression",
                     prediction_kind="continuous",
                     prediction_columns=predictor.info["prediction_columns"],
+                )
+            if predictor.info.get("postprocessing") is not None:
+                summary.update(
+                    target_unit=predictor.info["target_unit"],
+                    interval_columns=predictor.info["interval_columns"],
+                    postprocessing=predictor.info["postprocessing"],
                 )
             write_json(directory / "summary.json", summary)
             write_json(

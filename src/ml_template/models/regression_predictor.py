@@ -36,8 +36,6 @@ def validate_descriptor(descriptor, legacy_validator):
     }
     if set(descriptor) != expected:
         raise ValueError("Unexpected regression descriptor fields")
-    if descriptor["fitted_features"]:
-        raise ValueError("Regression fitted features are not yet supported")
     legacy = {k: v for k, v in descriptor.items() if k not in {"task", "prediction_kind"}}
     legacy["schema_version"] = 1
     return legacy_validator(legacy)
@@ -46,8 +44,11 @@ def validate_descriptor(descriptor, legacy_validator):
 def describe(cfg, root, kind, *, fold_ids=None, verify_artifact=None):
     from ml_template.models import predictor_selection as selection
 
-    if getattr(cfg, "task", None) != "regression" or cfg.fitted_features:
-        raise ValueError("Expected a regression config without fitted features")
+    if getattr(cfg, "task", None) != "regression":
+        raise ValueError("Expected a regression config")
+    from ml_template.preprocessing.numeric_preprocessing import validate_regression_specs
+
+    validate_regression_specs(cfg.fitted_features)
     descriptor = selection._legacy_describe_predictor(
         cfg, root, kind, fold_ids=fold_ids, verify_artifact=verify_artifact
     )
@@ -97,9 +98,10 @@ class RegressionFoldMeanPredictor(FinalRegressionPredictor):
         selection.verify_predictor_files(self.root, self.descriptor)
         total = np.zeros(len(X), dtype=np.float64)
         for member in self.descriptor["members"]:
-            selection.verify_predictor_files(
-                self.root, self.descriptor, names=[member["model_path"]]
-            )
+            names = [member["model_path"]]
+            if member["transformer_path"]:
+                names.append(member["transformer_path"])
+            selection.verify_predictor_files(self.root, self.descriptor, names=names)
             adapter = self.loader(self.cfg, selection.safe_file(self.root, member["model_path"]))
             try:
                 total += continuous(adapter.predict(X.copy(deep=True)), len(X)) / len(

@@ -1,0 +1,52 @@
+# Prospective design only. Existing validated Silver required. Never relabel an old split.
+# Illustrative small budget, not tuned performance settings. Drop recalibration_fraction to zero BEFORE splitting if no correction is planned.
+schema_version: 2
+task: regression
+experiment_name: patch_suite_regression
+seed: 42
+data:
+  dataset_name: concrete
+  dataset_config: configs/bronze_silver_contract.yaml
+  silver_dataset_version_id: silver_concrete_v1_6fe40821
+  feature_set_id: null
+split:
+  method: random
+  holdout_fraction: 0.2
+  calibration_fraction: 0.15
+  recalibration_fraction: 0.1
+  n_folds: 5
+  seed: 42
+training:
+  validation_fraction: 0.2
+  refit_rounds_factor: 1.0
+metrics:
+  primary: rmse
+  names:
+  - rmse
+  - mae
+  - r2
+  alert_rates: []
+analysis:
+  permutation_importance: false
+  error_sample_size: 0
+  learning_curves: false
+  learning_curve_metric: rmse
+fitted_features:
+- step: numeric_preprocessing
+  columns:
+  - cement
+  - blast_furnace_slag
+  numeric_strategy: median
+  scaling: standard
+model:
+  type: xgb
+  params:
+    objective: reg:squarederror
+    eval_metric: rmse
+    n_estimators: 200
+    early_stopping_rounds: 20
+    max_depth: 3
+    learning_rate: 0.05
+    subsample: 1.0
+    colsample_bytree: 1.0
+    device: cpu

@@ -80,6 +80,10 @@ def load_explanation(database, explanation_id, *, max_rows=100000):
     for name in ("explanation_id", "release_id", "scoring_batch_id", "n_rows", "n_features"):
         if summary.get(name) != record.get(name):
             raise ValueError(f"registry/summary mismatch: {name}")
+    if summary.get("task") == "regression":
+        from ml_template.explainability.regression_presentation import load_view
+
+        return load_view(record, summary, manifest, directory, max_rows=max_rows)
     if summary.get("schema_version") != 1 or summary.get("artifact_state") != "complete":
         raise ValueError("unsupported/incomplete explanation summary")
     if (

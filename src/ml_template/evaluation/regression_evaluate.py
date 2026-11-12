@@ -161,6 +161,9 @@ def evaluate_regression_spec(
 
         model = load_evaluation_predictor(p, adapter_loader=adapter_loader)
         prediction = continuous(model.predict(X), len(y))
+        from ml_template.evaluation.regression_postprocessing import evaluate as postprocess
+
+        prediction, post_columns, interval_rows = postprocess(p, prediction, y)
         frame = pd.DataFrame(
             {
                 p.key_col: p.hold_keys,
@@ -170,11 +173,12 @@ def evaluate_regression_spec(
                 "absolute_error": np.abs(y - prediction),
             }
         )
+        frame = frame.assign(**post_columns)
         frame.to_parquet(out / "holdout_predictions.parquet", index=False)
         values = regression_metrics(y, prediction)
         metric_rows = [
             {
-                "variant": "raw",
+                "variant": cfg.release_variant,
                 "metric": name,
                 "value": values.get(name),
                 "direction": "max" if name == "r2" else "min",
@@ -183,6 +187,7 @@ def evaluate_regression_spec(
             }
             for name in ["rmse", "mae", "r2"]
         ]
+        metric_rows.extend(interval_rows)
         acceptance = assess_regression_criteria(values, cfg)
         residual = y - prediction
         residual_summary = {
@@ -194,7 +199,7 @@ def evaluate_regression_spec(
             },
         }
         warnings = [
-            "Point estimates only; no bootstrap confidence intervals.",
+            "Point metrics have no bootstrap confidence intervals; any configured prediction intervals are distinct from metric confidence intervals.",
             "Final and CV-mean predictors are distinct frozen predictors; do not select between them on this holdout.",
             "Residual examples are exploratory, not independent model-selection evidence.",
             "Exposure tracking cannot detect unrecorded manual access or use in another database.",
@@ -210,8 +215,8 @@ def evaluate_regression_spec(
             "task": "regression",
             "parent_run_id": cfg.parent_run_id,
             "predictor_kind": cfg.predictor.kind,
-            "release_variant": "raw",
-            "calibration_id": None,
+            "release_variant": cfg.release_variant,
+            "calibration_id": cfg.calibration_id,
             "n_rows": len(y),
             "primary_metric": cfg.primary_metric,
             "primary_metric_direction": "min",
@@ -220,6 +225,10 @@ def evaluate_regression_spec(
             "prior_exposure": bool(prior),
             "automatic_promotion": False,
         }
+        if cfg.calibration_id is not None:
+            summary.update(
+                target_unit=cfg.target_unit, interval_coverages=list(cfg.uncertainty.coverages)
+            )
         data = clean(
             {
                 "summary": summary,

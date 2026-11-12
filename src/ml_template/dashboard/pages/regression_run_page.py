@@ -32,7 +32,9 @@ def table(frame, max_rows=1000):
     shown = frame.head(max_rows)
 
     def scalar(value):
-        if value is None or pd.isna(value):
+        if value is None:
+            return "—"
+        if pd.api.types.is_scalar(value) and pd.isna(value):
             return "—"
         return f"{value:.6g}" if isinstance(value, float) else str(value)
 
@@ -148,6 +150,37 @@ def view(engine, run_id, selected=None, fold=-1):
             )
         )
         return html.Div(result)
+    if analysis["summary"].get("analysis_kind") == "oof_residuals_v1":
+        summary = analysis["summary"]
+        pooled = summary["pooled"]
+        result.extend(
+            [
+                html.H4("Development OOF residual summary"),
+                html.P(
+                    "Residual = observed minus OOF prediction; positive means underprediction. No model replay or holdout labels."
+                ),
+                table(
+                    pd.DataFrame(
+                        [
+                            {"metric": k, "value": v}
+                            for k, v in pooled.items()
+                            if k != "residual_quantiles"
+                        ]
+                    )
+                ),
+                html.H4("Residual quantiles"),
+                table(
+                    pd.DataFrame(
+                        [
+                            {"quantile": k, "residual": v}
+                            for k, v in pooled["residual_quantiles"].items()
+                        ]
+                    )
+                ),
+                html.H4("Per-fold OOF residual summary"),
+                table(pd.DataFrame(summary["fold_summaries"]).drop(columns="residual_quantiles")),
+            ]
+        )
     result.extend(
         [
             html.H4("Selected analysis: " + analysis["id"]),

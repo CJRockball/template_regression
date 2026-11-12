@@ -60,8 +60,12 @@ def prepare_features(X: pd.DataFrame) -> pd.DataFrame:
 def _adapter_class(model_type: str, task: str = "binary_classification") -> type:
     """The adapter class for a model type. Imports only the library that is needed."""
     if task == "regression":
+        if model_type == "nn":
+            from ml_template.models.nn_regressor import NNRegressionAdapter
+
+            return NNRegressionAdapter
         if model_type != "xgb":
-            raise ValueError("Only XGB regression is implemented")
+            raise ValueError("Only XGB and NN regression training are implemented")
         from ml_template.models.xgb_regressor import XGBRegressionAdapter
 
         return XGBRegressionAdapter

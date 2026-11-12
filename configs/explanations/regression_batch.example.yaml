@@ -1,0 +1,18 @@
+schema_version: 1
+task: regression
+target_unit: target_units  # Replace with your declared target unit.
+release_dir: artifacts/releases/REPLACE_RELEASE_ID
+scoring_dir: artifacts/scores/REPLACE_SCORING_BATCH_ID
+expected_release_id: REPLACE_RELEASE_ID
+expected_scoring_batch_id: REPLACE_SCORING_BATCH_ID
+# Choose an interpreter that imports the EXACT runtime recorded by this release.
+runtime_python: /REPLACE_WITH_PINNED_ENV/bin/python
+runtime_source_root: /REPLACE_WITH_PINNED_CHECKOUT/src/ml_template
+registry_path: data/project.db
+output_root: artifacts/explanations
+chunk_size: 256
+max_rows: 100000
+timeout_seconds: 600
+prediction_atol: 0.00001
+prediction_rtol: 0.00001
+groups: {}

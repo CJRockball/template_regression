@@ -47,6 +47,13 @@ def main(argv=None):
         raise ValueError("scoring input must not contain target/label columns")
     frame = canonicalize_frame(raw, spec, columns=spec["required_columns"])
     validate_batch(frame, contract, enforce_rates=True)
+    if (
+        "predictor.json" in manifest.get("files", {})
+        and read_json(args.release / "predictor.json").get("task") == "regression"
+    ):
+        from ml_template.scoring.predictor import ReleasedPredictor
+
+        ReleasedPredictor(args.release).prepare_features(frame)
     if sha256(args.input) != before:
         raise ValueError("input changed during preparation")
     report = {

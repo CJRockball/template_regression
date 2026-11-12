@@ -1,0 +1,9 @@
+schema_version: 2
+task: regression
+name: regression_intervals_research
+parent_run_id: REPLACE_WITH_NEW_RUN_ID
+evaluation_id: REPLACE_WITH_EVALUATION_ID
+calibration_id: REPLACE_WITH_REGCAL_ID
+intended_use: Research; no automatic deployment approval
+acknowledge_research_release: true
+parity_atol: 0.0000001
