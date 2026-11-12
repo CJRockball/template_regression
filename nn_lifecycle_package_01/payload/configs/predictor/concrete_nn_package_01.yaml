@@ -1,8 +1,0 @@
-# Package 01 only: metadata / checkpoint verification. Not an evaluation or release request.
-parent_run_id: run_20261111_135508_ccf0e8
-predictor_kind: final
-# Set cv_mean to verify every stored outer-fold checkpoint instead.
-database: data/project.db
-expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
-expected_feature_set_id: null
-expected_split_id: split_841e3a09cb9d

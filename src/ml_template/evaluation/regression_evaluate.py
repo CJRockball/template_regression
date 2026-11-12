@@ -99,11 +99,23 @@ def evaluate_regression_spec(
     adapter_loader=None,
 ):
     roots = {"silver_root": silver_root, "split_root": split_root, "feature_root": feature_root}
-    p = prepare_regression(engine, cfg, **roots)
+    from ml_template.evaluation import nn_evaluate as nn
+
+    neural = nn.is_nn_parent(engine, cfg.parent_run_id)
+    prepare = nn.prepare_nn_evaluation if neural else prepare_regression
+    p = prepare(engine, cfg, **roots)
     cfg = p.spec
-    cached = registry.cached_evaluation(engine, p.identity_hash)
+    cached = (
+        nn.cached(engine, p.identity_hash)
+        if neural
+        else registry.cached_evaluation(engine, p.identity_hash)
+    )
     if cached:
-        data = _verify_cache(cached, p.identity_hash)
+        data = (
+            nn.verify_cache(engine, cached, p.identity_hash)
+            if neural
+            else _verify_cache(cached, p.identity_hash)
+        )
         return {
             "evaluation_id": cached["evaluation_id"],
             "status": "succeeded",
@@ -111,10 +123,27 @@ def evaluate_regression_spec(
             "artifact_dir": cached["artifact_dir"],
             "summary": data["summary"],
             "holdout_labels_loaded": False,
+            **(
+                {
+                    "ready": True,
+                    "model_type": "nn",
+                    "models_loaded": False,
+                    "files_written": False,
+                    "predictions_computed": False,
+                    "release_enabled": False,
+                }
+                if neural
+                else {}
+            ),
         }
-    prior = exposure_warnings(engine, p)
+    prior_fn = nn.exposure_warnings if neural else exposure_warnings
+    prior = prior_fn(engine, p)
     if cfg.supersedes_evaluation_id:
-        previous = registry.get_evaluation(engine, cfg.supersedes_evaluation_id)
+        previous = (
+            nn.record(engine, cfg.supersedes_evaluation_id)
+            if neural
+            else registry.get_evaluation(engine, cfg.supersedes_evaluation_id)
+        )
         if not previous or previous["parent_run_id"] != cfg.parent_run_id:
             raise ValueError("Superseded evaluation must share the parent")
     if check_only:
@@ -127,6 +156,17 @@ def evaluate_regression_spec(
             "ready": not prior or cfg.acknowledge_prior_exposure,
             "resolved_spec": cfg.model_dump(mode="json"),
             "holdout_labels_loaded": False,
+            **(
+                {
+                    "model_type": "nn",
+                    "models_loaded": False,
+                    "files_written": False,
+                    "predictions_computed": False,
+                    "release_enabled": False,
+                }
+                if neural
+                else {}
+            ),
         }
     if prior and not cfg.acknowledge_prior_exposure:
         raise ValueError("Holdout previously exposed; document and acknowledge prior exposure")
@@ -134,6 +174,8 @@ def evaluate_regression_spec(
         from ml_template.paths import ARTIFACTS
 
         output_root = ARTIFACTS / "evaluations"
+    if neural:
+        nn.validate_output(p, output_root)
     eid = f"eval_{datetime.now(UTC):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
     out = (Path(output_root) / eid).resolve()
     registry.start_evaluation(
@@ -146,9 +188,9 @@ def evaluate_regression_spec(
         prior=prior,
     )
     try:
-        if exposure_warnings(engine, p) != prior:
+        if prior_fn(engine, p) != prior:
             raise RuntimeError("Exposure history changed; rerun preflight")
-        fresh = prepare_regression(engine, cfg, **roots)
+        fresh = prepare(engine, cfg, **roots)
         if fresh.identity_hash != p.identity_hash:
             raise ValueError("Evaluation inputs changed after preflight")
         out.mkdir(parents=True, exist_ok=False)
@@ -156,14 +198,19 @@ def evaluate_regression_spec(
         write_json(out / "provenance.json", p.provenance)
         # Commit exposure BEFORE loading target values; failures remain auditable.
         registry.mark_accessed(engine, eid, cfg.parent_run_id)
-        X, y = load_holdout(p)
+        X, y = nn.load_authorized_holdout(engine, p, eid) if neural else load_holdout(p)
         from ml_template.models.predictor_selection import load_evaluation_predictor
 
         model = load_evaluation_predictor(p, adapter_loader=adapter_loader)
         prediction = continuous(model.predict(X), len(y))
         from ml_template.evaluation.regression_postprocessing import evaluate as postprocess
 
+        raw_prediction = prediction.copy() if neural else None
         prediction, post_columns, interval_rows = postprocess(p, prediction, y)
+        if neural:
+            post_columns.setdefault("y_pred_raw", raw_prediction)
+            if prepare(engine, cfg, **roots).identity_hash != p.identity_hash:
+                raise ValueError("NN inputs/calibration changed during evaluation")
         frame = pd.DataFrame(
             {
                 p.key_col: p.hold_keys,
@@ -176,6 +223,8 @@ def evaluate_regression_spec(
         frame = frame.assign(**post_columns)
         frame.to_parquet(out / "holdout_predictions.parquet", index=False)
         values = regression_metrics(y, prediction)
+        if neural and any(not np.isfinite(value) for value in values.values()):
+            raise ValueError("Nonfinite NN evaluation metric")
         metric_rows = [
             {
                 "variant": cfg.release_variant,
@@ -229,6 +278,13 @@ def evaluate_regression_spec(
             summary.update(
                 target_unit=cfg.target_unit, interval_coverages=list(cfg.uncertainty.coverages)
             )
+        if neural:
+            summary.update(
+                model_type="nn",
+                nn_evaluation_schema=1,
+                target_unit=cfg.target_unit,
+                interval_coverages=list(cfg.uncertainty.coverages),
+            )
         data = clean(
             {
                 "summary": summary,
@@ -267,4 +323,15 @@ def evaluate_regression_spec(
         "artifact_dir": str(out),
         "summary": summary,
         "holdout_labels_loaded": True,
+        **(
+            {
+                "model_type": "nn",
+                "models_loaded": True,
+                "files_written": True,
+                "predictions_computed": True,
+                "release_enabled": False,
+            }
+            if neural
+            else {}
+        ),
     }

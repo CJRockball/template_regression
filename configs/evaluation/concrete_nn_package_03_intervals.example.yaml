@@ -1,0 +1,20 @@
+# Replace ID with the actual bound Package 02 calibration. Not a comparison sweep.
+schema_version: 2
+task: regression
+parent_run_id: run_20261111_135508_ccf0e8
+predictor:
+  kind: final
+primary_metric: rmse
+target_unit: MPa
+expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
+expected_split_id: split_841e3a09cb9d
+calibration_id: regcal_REPLACE_WITH_PACKAGE02_ID
+# raw for correction:none; recalibrated for a bound bias/affine correction.
+release_variant: raw
+uncertainty:
+  enabled: true
+  coverages: [0.9]
+criteria: []
+intended_use: "Exploratory NN intervals; no automatic deployment approval"
+acknowledge_prior_exposure: false
+prior_exposure_note: ""

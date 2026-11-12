@@ -1,0 +1,904 @@
+diff --git a/src/ml_template/evaluation/regression_evaluate.py b/src/ml_template/evaluation/regression_evaluate.py
+--- a/src/ml_template/evaluation/regression_evaluate.py
++++ b/src/ml_template/evaluation/regression_evaluate.py
+@@ -99,11 +99,14 @@
+     adapter_loader=None,
+ ):
+     roots = {"silver_root": silver_root, "split_root": split_root, "feature_root": feature_root}
+-    p = prepare_regression(engine, cfg, **roots)
++    from ml_template.evaluation import nn_evaluate as nn
++    neural = nn.is_nn_parent(engine, cfg.parent_run_id)
++    prepare = nn.prepare_nn_evaluation if neural else prepare_regression
++    p = prepare(engine, cfg, **roots)
+     cfg = p.spec
+-    cached = registry.cached_evaluation(engine, p.identity_hash)
++    cached = nn.cached(engine, p.identity_hash) if neural else registry.cached_evaluation(engine, p.identity_hash)
+     if cached:
+-        data = _verify_cache(cached, p.identity_hash)
++        data = nn.verify_cache(engine, cached, p.identity_hash) if neural else _verify_cache(cached, p.identity_hash)
+         return {
+             "evaluation_id": cached["evaluation_id"],
+             "status": "succeeded",
+@@ -111,10 +114,13 @@
+             "artifact_dir": cached["artifact_dir"],
+             "summary": data["summary"],
+             "holdout_labels_loaded": False,
+-        }
+-    prior = exposure_warnings(engine, p)
++            **({"ready": True, "model_type": "nn", "models_loaded": False, "files_written": False,
++                "predictions_computed": False, "release_enabled": False} if neural else {}),
++        }
++    prior_fn = nn.exposure_warnings if neural else exposure_warnings
++    prior = prior_fn(engine, p)
+     if cfg.supersedes_evaluation_id:
+-        previous = registry.get_evaluation(engine, cfg.supersedes_evaluation_id)
++        previous = nn.record(engine, cfg.supersedes_evaluation_id) if neural else registry.get_evaluation(engine, cfg.supersedes_evaluation_id)
+         if not previous or previous["parent_run_id"] != cfg.parent_run_id:
+             raise ValueError("Superseded evaluation must share the parent")
+     if check_only:
+@@ -127,6 +133,8 @@
+             "ready": not prior or cfg.acknowledge_prior_exposure,
+             "resolved_spec": cfg.model_dump(mode="json"),
+             "holdout_labels_loaded": False,
++            **({"model_type": "nn", "models_loaded": False, "files_written": False,
++                "predictions_computed": False, "release_enabled": False} if neural else {}),
+         }
+     if prior and not cfg.acknowledge_prior_exposure:
+         raise ValueError("Holdout previously exposed; document and acknowledge prior exposure")
+@@ -134,6 +142,8 @@
+         from ml_template.paths import ARTIFACTS
+ 
+         output_root = ARTIFACTS / "evaluations"
++    if neural:
++        nn.validate_output(p, output_root)
+     eid = f"eval_{datetime.now(UTC):%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:8]}"
+     out = (Path(output_root) / eid).resolve()
+     registry.start_evaluation(
+@@ -146,9 +156,9 @@
+         prior=prior,
+     )
+     try:
+-        if exposure_warnings(engine, p) != prior:
++        if prior_fn(engine, p) != prior:
+             raise RuntimeError("Exposure history changed; rerun preflight")
+-        fresh = prepare_regression(engine, cfg, **roots)
++        fresh = prepare(engine, cfg, **roots)
+         if fresh.identity_hash != p.identity_hash:
+             raise ValueError("Evaluation inputs changed after preflight")
+         out.mkdir(parents=True, exist_ok=False)
+@@ -156,14 +166,19 @@
+         write_json(out / "provenance.json", p.provenance)
+         # Commit exposure BEFORE loading target values; failures remain auditable.
+         registry.mark_accessed(engine, eid, cfg.parent_run_id)
+-        X, y = load_holdout(p)
++        X, y = nn.load_authorized_holdout(engine, p, eid) if neural else load_holdout(p)
+         from ml_template.models.predictor_selection import load_evaluation_predictor
+ 
+         model = load_evaluation_predictor(p, adapter_loader=adapter_loader)
+         prediction = continuous(model.predict(X), len(y))
+         from ml_template.evaluation.regression_postprocessing import evaluate as postprocess
+ 
++        raw_prediction = prediction.copy() if neural else None
+         prediction, post_columns, interval_rows = postprocess(p, prediction, y)
++        if neural:
++            post_columns.setdefault("y_pred_raw", raw_prediction)
++            if prepare(engine, cfg, **roots).identity_hash != p.identity_hash:
++                raise ValueError("NN inputs/calibration changed during evaluation")
+         frame = pd.DataFrame(
+             {
+                 p.key_col: p.hold_keys,
+@@ -176,6 +191,8 @@
+         frame = frame.assign(**post_columns)
+         frame.to_parquet(out / "holdout_predictions.parquet", index=False)
+         values = regression_metrics(y, prediction)
++        if neural and any(not np.isfinite(value) for value in values.values()):
++            raise ValueError("Nonfinite NN evaluation metric")
+         metric_rows = [
+             {
+                 "variant": cfg.release_variant,
+@@ -229,6 +246,9 @@
+             summary.update(
+                 target_unit=cfg.target_unit, interval_coverages=list(cfg.uncertainty.coverages)
+             )
++        if neural:
++            summary.update(model_type="nn", nn_evaluation_schema=1, target_unit=cfg.target_unit,
++                           interval_coverages=list(cfg.uncertainty.coverages))
+         data = clean(
+             {
+                 "summary": summary,
+@@ -267,4 +287,6 @@
+         "artifact_dir": str(out),
+         "summary": summary,
+         "holdout_labels_loaded": True,
++        **({"model_type": "nn", "models_loaded": True, "files_written": True,
++            "predictions_computed": True, "release_enabled": False} if neural else {}),
+     }
+diff --git a/src/ml_template/dashboard/regression_multi_data.py b/src/ml_template/dashboard/regression_multi_data.py
+--- a/src/ml_template/dashboard/regression_multi_data.py
++++ b/src/ml_template/dashboard/regression_multi_data.py
+@@ -511,6 +511,20 @@
+     return digest({"silver": silver_id, "key": key, "members": sorted(encoded)})
+ 
+ 
++def _load_nn_evaluation(engine, record, directory, predictions):
++    from ml_template.tracking.nn_evaluation_contract import read_document, validate_report, validate_predictions
++
++    data = read_document(directory)
++    stored = base.rows(engine, "SELECT result_json FROM final_evaluation_metrics WHERE evaluation_id=?", (record["evaluation_id"],))
++    validate_report(data, record, [json.loads(row["result_json"]) for row in stored])
++    frame = None
++    if predictions:
++        frame = pd.read_parquet(base.safe(directory, "holdout_predictions.parquet"))
++        validate_predictions(frame, data)
++    return {"state": "verified", "record": record, "data": data, "predictions": frame,
++            "message": "Frozen NN evidence verified against saved sidecars/registry. No evaluator, model or source dataset was used. Labelled predictions require explicit opt-in."}
++
++
+ def load_regression_evaluation(engine, evaluation_id, predictions=False):
+     """Read already registered evidence; never invoke evaluation or mark access."""
+     if not evaluation_id:
+@@ -574,6 +588,8 @@
+             or record.get("holdout_fingerprint") != provenance["holdout_fingerprint"]
+         ):
+             raise ValueError("Frozen evaluation dataset/population differs")
++        if provenance.get("predictor", {}).get("schema_version") == 3:
++            return _load_nn_evaluation(engine, record, directory, predictions)
+         if (
+             record.get("calibration_id") is not None
+             or spec.get("calibration_id") is not None
+diff --git a/src/ml_template/dashboard/regression_multi_views.py b/src/ml_template/dashboard/regression_multi_views.py
+--- a/src/ml_template/dashboard/regression_multi_views.py
++++ b/src/ml_template/dashboard/regression_multi_views.py
+@@ -450,7 +450,10 @@
+             html.P(loaded["message"]),
+             html.P("Recorded access: " + singapore(loaded["record"].get("accessed_at"))),
+             html.P(
+-                "Metrics are frozen point estimates; no new metrics or intervals are calculated. Prior exposure is the state recorded at evaluation time, not a claim of current untouched data. Units were not frozen by this evaluator: shown in native target units."
++                "Frozen metrics only; no evaluation is run here. Prior exposure is recorded history, not a claim of untouched data. "
++                + ("Frozen target unit: " + str(document["summary"]["target_unit"]) + ". R2 is dimensionless; prediction intervals are not metric confidence intervals."
++                   if document["summary"].get("model_type") == "nn"
++                   else "Units were not frozen by this evaluator: shown in native target units.")
+             ),
+             table(pd.DataFrame([document["summary"]])),
+             html.H4("Saved holdout metrics"),
+@@ -497,7 +500,8 @@
+                 "Saved labelled predictions have not been read. Enable explicitly to display them; source datasets/models are never opened."
+             )
+         frame = loaded["predictions"].rename(columns={"y_pred": "y_pred_oof"})
+-        charts = figures.residual_figures(frame, "native target units")
++        unit = loaded["data"]["summary"].get("target_unit") or "native target units"
++        charts = figures.residual_figures(frame, unit)
+         for fig in charts:
+             if fig.layout.title.text:
+                 fig.update_layout(title=fig.layout.title.text.replace("OOF", "saved holdout"))
+diff --git a/src/ml_template/tracking/nn_evaluation_contract.py b/src/ml_template/tracking/nn_evaluation_contract.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/tracking/nn_evaluation_contract.py
+@@ -0,0 +1,206 @@
++"""Read-only NN evaluation evidence validation; no model/evaluator/source imports."""
++import hashlib
++import json
++import math
++from pathlib import Path, PurePosixPath
++import numpy as np
++
++def digest(value):
++    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
++
++def number(value):
++    return type(value) in (int, float) and math.isfinite(value)
++
++def safe(root, name):
++    root = Path(root).resolve()
++    part = PurePosixPath(name)
++    if not name or part.is_absolute() or '..' in part.parts or ('\\' in name) or (part.as_posix() != name):
++        raise ValueError('Unsafe frozen artifact path')
++    path = root.joinpath(*part.parts)
++    if not path.resolve().is_relative_to(root) or path.is_symlink() or any((p.is_symlink() for p in path.parents if p != root and p.is_relative_to(root))):
++        raise ValueError('Unsafe frozen artifact symlink')
++    return path
++
++def read_json(path):
++
++    def pairs(items):
++        result = {}
++        for k, v in items:
++            if k in result:
++                raise ValueError('Duplicate frozen JSON key')
++            result[k] = v
++        return result
++
++    def invalid(v):
++        raise ValueError('Nonfinite frozen JSON constant: ' + v)
++    return json.loads(Path(path).read_text(), object_pairs_hook=pairs, parse_constant=invalid)
++
++def sha256(path):
++    h = hashlib.sha256()
++    with Path(path).open('rb') as stream:
++        for block in iter(lambda: stream.read(1 << 20), b''):
++            h.update(block)
++    return h.hexdigest()
++
++def read_document(root):
++    entries = read_json(safe(root, 'artifact_manifest.json'))['files']
++    required = {'report_data.json', 'summary.json', 'spec.json', 'provenance.json', 'metrics.csv', 'acceptance.json', 'holdout_predictions.parquet', 'residual_summary.json', 'report.html'}
++    if not isinstance(entries, dict) or not required <= set(entries):
++        raise ValueError('Incomplete frozen NN evaluation')
++    for name, item in entries.items():
++        if sha256(safe(root, name)) != item['sha256']:
++            raise ValueError('Frozen NN artifact changed: ' + name)
++    data = read_json(safe(root, 'report_data.json'))
++    for key in ('summary', 'spec', 'provenance', 'acceptance', 'residual_summary'):
++        if data[key] != read_json(safe(root, key + '.json')):
++            raise ValueError('Frozen NN report/sidecar differs: ' + key)
++    return data
++
++def prediction_binding(p):
++    return {'predictor': p['predictor'], 'input_hashes': {k: v for k, v in p['input_hashes'].items() if k != 'regression_calibration'}, 'feature_preparation': p['feature_preparation'], 'code_hashes': {k: v for k, v in p['code_hashes'].items() if k.startswith(('models/', 'features/', 'preprocessing/', 'training/')) or k in {'evaluation/regression_inputs.py', 'evaluation/regression_postprocessing.py'}}, 'versions': p['versions'], 'python': p['python']}
++
++def interval_state(spec, p):
++    u = spec['uncertainty']
++    selected = u.get('coverages', [])
++    if type(u['enabled']) is not bool or bool(selected) != u['enabled'] or selected != sorted(set(selected)):
++        raise ValueError('Invalid frozen interval request')
++    if spec.get('calibration_id') is None:
++        if selected or spec['release_variant'] != 'raw' or 'postprocessing' in p or ('regression_calibration' in p['input_hashes']):
++            raise ValueError('Unexpected NN postprocessing')
++        return (None, {})
++    item = p['postprocessing']
++    state = item['state']
++    c = state['config']
++    parameters = state['parameters']
++    if digest({k: v for k, v in state.items() if k != 'payload_sha256'}) != state['payload_sha256'] or state['calibration_id'] != spec['calibration_id'] or item['calibration_id'] != spec['calibration_id'] or (c.get('model_type') != 'nn') or (c['parent_run_id'] != spec['parent_run_id']) or (c['predictor_kind'] != spec['predictor']['kind']) or (c['target_unit'] != spec['target_unit']) or (state['binding'] != prediction_binding(p)) or (item['sha256'] != p['input_hashes'].get('regression_calibration')) or (state.get('holdout_labels_loaded') is not False):
++        raise ValueError('Frozen NN calibration binding differs')
++    correction = parameters['correction']
++    if set(parameters) != {'schema_version', 'correction', 'n_calibration', 'quantiles'} or type(parameters['schema_version']) is not int or parameters['schema_version'] != 1 or (set(correction) != {'method', 'slope', 'intercept'}) or (correction['method'] not in {'none', 'bias', 'affine'}) or (not number(correction['slope'])) or (not number(correction['intercept'])) or (correction['method'] != c['correction']) or (correction['method'] in {'none', 'bias'} and correction['slope'] != 1) or (correction['method'] == 'none' and correction['intercept'] != 0) or ((spec['release_variant'] == 'recalibrated') != (correction['method'] != 'none')):
++        raise ValueError('Invalid frozen NN correction')
++    n = parameters['n_calibration']
++    quantiles = parameters['quantiles']
++    if type(n) is not int or n < 0 or (not isinstance(quantiles, dict)):
++        raise ValueError('Invalid frozen calibration support')
++    ordered = []
++    for tag, q in quantiles.items():
++        level = q['coverage']
++        if not number(level) or not 0 < level < 1:
++            raise ValueError('Invalid coverage')
++        code = round(level * 1000000)
++        rank = ((n + 1) * code + 999999) // 1000000
++        if not 0 < code < 1000000 or abs(code / 1000000 - level) > 1e-12 or tag != 'c' + str(code) or (set(q) != {'coverage', 'rank', 'half_width'}) or (type(q['rank']) is not int) or (q['rank'] != rank) or (not 1 <= rank <= n) or (not number(q['half_width'])) or (q['half_width'] < 0):
++            raise ValueError('Invalid finite conformal quantile')
++        ordered.append((level, q['half_width']))
++    ordered.sort()
++    if [x[0] for x in ordered] != c['coverages'] or [x[1] for x in ordered] != sorted((x[1] for x in ordered)):
++        raise ValueError('Non-nested or inconsistent calibrated levels')
++    chosen = {}
++    for level in selected:
++        if not number(level):
++            raise ValueError('Invalid selected coverage')
++        tag = 'c' + str(round(level * 1000000))
++        if tag not in quantiles or quantiles[tag]['coverage'] != level:
++            raise ValueError('Uncalibrated selected level')
++        chosen[tag] = quantiles[tag]
++    return (parameters, chosen)
++
++def validate_report(data, record, stored):
++    s, cfg, p = (data['summary'], data['spec'], data['provenance'])
++    if record['status'] != 'succeeded' or not record.get('accessed_at') or s.get('model_type') != 'nn' or (type(s.get('nn_evaluation_schema')) is not int) or (s.get('nn_evaluation_schema') != 1) or (p.get('nn_evaluation_schema') != 1) or (s.get('task') != 'regression') or (cfg.get('task') != 'regression') or (cfg.get('schema_version') != 2) or (type(s['n_rows']) is not int) or (s['n_rows'] < 1) or (s.get('automatic_promotion') is not False) or (data['acceptance'].get('automatic_promotion') is not False):
++        raise ValueError('Invalid frozen NN evaluation semantics')
++    if s['evaluation_id'] != record['evaluation_id'] or cfg['parent_run_id'] != record['parent_run_id'] or s['parent_run_id'] != record['parent_run_id'] or (cfg != json.loads(record['spec_json'])) or (digest({'spec': cfg, 'provenance': p}) != record['identity_hash']) or (s['identity_hash'] != record['identity_hash']) or (cfg['expected_silver_dataset_version_id'] != record['silver_id']) or (p['holdout_fingerprint'] != record['holdout_fingerprint']) or (record.get('calibration_id') != cfg.get('calibration_id')) or (s.get('calibration_id') != cfg.get('calibration_id')) or (s['release_variant'] != cfg['release_variant']):
++        raise ValueError('Frozen NN registry identity differs')
++    prior = json.loads(record['prior_json'])
++    if data['prior_exposures'] != prior or type(s['prior_exposure']) is not bool or s['prior_exposure'] != bool(prior):
++        raise ValueError('Frozen prior-exposure evidence differs')
++    unit = cfg.get('target_unit')
++    if not isinstance(unit, str) or not unit.strip() or unit.strip() in {'target units', 'target_units'} or (s.get('target_unit') != unit):
++        raise ValueError('Explicit consistent NN units required')
++    d = p['predictor']
++    members = d['members']
++    if type(d['schema_version']) is not int or d['schema_version'] != 3 or d['task'] != 'regression' or (d['prediction_kind'] != 'continuous') or (d['model_type'] != 'nn') or (d['fitted_features'] is not False) or (d['weighting'] != 'equal') or (d['kind'] not in {'final', 'cv_mean'}) or (d['kind'] != cfg['predictor']['kind']) or (d['kind'] != s['predictor_kind']) or (d['serialization'] != {'format': 'torch', 'weights_only': True, 'checkpoint_version': 1, 'preprocessing': 'embedded'}) or (d['serialization']['weights_only'] is not True) or (type(d['serialization']['checkpoint_version']) is not int) or (not isinstance(members, list)) or (not members) or (d['kind'] == 'final' and len(members) != 1) or (d['kind'] == 'cv_mean' and len(members) < 2):
++        raise ValueError('Frozen NN descriptor differs')
++    names = {'config.json', 'features.json'}
++    model_names = set()
++    if d['kind'] == 'cv_mean':
++        names.add('cv_folds.csv')
++    for i, m in enumerate(members):
++        name = 'model.ubj' if d['kind'] == 'final' else f'fold_models/fold_{i}.ubj'
++        if m['model_path'] != name or m['transformer_path'] is not None or (not number(m['weight'])) or (abs(m['weight'] - 1 / len(members)) > 1e-15) or (m['fold_id'] is not None if d['kind'] == 'final' else type(m['fold_id']) is not int or m['fold_id'] != i):
++            raise ValueError('Invalid NN member inventory')
++        names.add(name)
++        model_names.add(name)
++    if set(d['files_sha256']) != names or set(d['training_rows']) != model_names or any((type(v) is not int or v < 1 for v in d['training_rows'].values())) or any((not isinstance(v, str) or len(v) != 64 or any((c not in '0123456789abcdef' for c in v)) for v in d['files_sha256'].values())):
++        raise ValueError('NN hash/fit-row coverage differs')
++    _, chosen = interval_state(cfg, p)
++    if s['interval_coverages'] != [v['coverage'] for v in chosen.values()]:
++        raise ValueError('Selected interval levels differ')
++    metrics = data['metrics']
++    lookup = {r['metric']: r for r in metrics}
++    directions = {'rmse': 'min', 'mae': 'min', 'r2': 'max'}
++    expected = set(directions) | {name + '_' + tag for tag in chosen for name in ['empirical_coverage', 'mean_width']}
++    if len(lookup) != len(metrics) or set(lookup) != expected:
++        raise ValueError('Duplicate/incomplete frozen NN metrics')
++    for name, row in lookup.items():
++        value = row['value']
++        if row['variant'] != cfg['release_variant']:
++            raise ValueError('Metric variant differs')
++        if name in directions:
++            if row['direction'] != directions[name] or row['uncertainty'] != 'not_requested':
++                raise ValueError('Point metric semantics differ')
++            if value is None:
++                if name != 'r2' or row['status'] != 'undefined':
++                    raise ValueError('Undefined error metric')
++            elif not number(value) or row['status'] != 'defined' or (name != 'r2' and value < 0):
++                raise ValueError('Invalid point score')
++        elif row['direction'] != 'diagnostic' or row['status'] != 'defined' or row['uncertainty'] != 'split_conformal_prediction_interval' or (not number(value)) or (value < 0) or (name.startswith('empirical_coverage_') and value > 1):
++            raise ValueError('Invalid interval metric')
++    if s['primary_metric'] != cfg['primary_metric'] or s['primary_metric_direction'] != 'min' or s['primary_value'] != lookup[cfg['primary_metric']]['value']:
++        raise ValueError('Primary score differs')
++    criteria = []
++    for criterion in cfg.get('criteria', []):
++        value = lookup[criterion['metric']]['value']
++        passed = None if value is None else bool(value <= criterion['value'] if criterion['operator'] == '<=' else value >= criterion['value'])
++        criteria.append({**criterion, 'observed': value, 'passed': passed, 'status': 'unavailable' if passed is None else 'passed' if passed else 'failed'})
++    status = 'not_assessed' if not criteria else 'failed' if any((r['status'] == 'failed' for r in criteria)) else 'unavailable' if any((r['status'] == 'unavailable' for r in criteria)) else 'passed'
++    if data['acceptance']['results'] != criteria or data['acceptance']['status'] != status or s['criteria_status'] != status:
++        raise ValueError('Criteria differ from frozen scores')
++
++    def key(r):
++        return (r['variant'], r['metric'])
++    if sorted(metrics, key=key) != sorted(stored, key=key):
++        raise ValueError('Frozen scores differ from registered metrics')
++    return data
++
++def validate_predictions(frame, data):
++    s, cfg, p = (data['summary'], data['spec'], data['provenance'])
++    parameters, chosen = interval_state(cfg, p)
++    numeric = {'y_true', 'y_pred', 'y_pred_raw', 'residual', 'absolute_error'} | {prefix + tag for tag in chosen for prefix in ['pi_lower_', 'pi_upper_']}
++    keys = [c for c in frame if c not in numeric]
++    if not frame.columns.is_unique or len(keys) != 1 or set(frame) != numeric | set(keys) or (len(frame) != s['n_rows']) or frame[keys[0]].isna().any() or frame[keys[0]].duplicated().any():
++        raise ValueError('Saved NN key/schema/support differs')
++    encoded = []
++    for value in frame[keys[0]]:
++        if isinstance(value, np.generic):
++            value = value.item()
++        if isinstance(value, bool) or not isinstance(value, (int, str)):
++            raise ValueError('Invalid saved key')
++        encoded.append(json.dumps([type(value).__name__, value]))
++    if digest({'silver': cfg['expected_silver_dataset_version_id'], 'key': keys[0], 'members': sorted(encoded)}) != p['holdout_fingerprint']:
++        raise ValueError('Saved population fingerprint differs')
++    for name in numeric:
++        a = frame[name].to_numpy()
++        if a.dtype.kind not in 'iuf' or not np.isfinite(a).all():
++            raise ValueError('Invalid saved numeric values')
++    if not np.allclose(frame.residual, frame.y_true - frame.y_pred) or not np.allclose(frame.absolute_error, frame.residual.abs()):
++        raise ValueError('Saved residuals differ')
++    point = frame.y_pred_raw.to_numpy(float)
++    if parameters is not None:
++        c = parameters['correction']
++        point = point * c['slope'] + c['intercept']
++    if not np.allclose(point, frame.y_pred, atol=1e-10, rtol=1e-10):
++        raise ValueError('Saved point correction differs')
++    for tag, q in chosen.items():
++        if not np.allclose(frame['pi_lower_' + tag], point - q['half_width'], atol=1e-10, rtol=1e-10) or not np.allclose(frame['pi_upper_' + tag], point + q['half_width'], atol=1e-10, rtol=1e-10):
++            raise ValueError('Saved interval arithmetic differs')
++    return frame
+diff --git a/src/ml_template/evaluation/nn_evaluate.py b/src/ml_template/evaluation/nn_evaluate.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/evaluation/nn_evaluate.py
+@@ -0,0 +1,130 @@
++"""NN preparation/authorization and thin CLI; execution uses the shared evaluator."""
++import argparse
++import copy
++import json
++import sqlite3
++from pathlib import Path
++from ml_template.db import evaluation_registry as registry
++from ml_template.tracking.nn_evaluation_contract import digest, read_document, validate_report
++
++def rows(engine, table, sql, params=()):
++    if table not in {'model_runs', 'final_evaluations', 'final_evaluation_metrics', 'final_evaluation_locks'}:
++        raise ValueError('Unknown registry table')
++    with registry.connection(engine) as c:
++        if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
++            return []
++        cursor = c.execute(sql, params)
++        names = [d[0] for d in cursor.description]
++        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
++
++def is_nn_parent(engine, run_id):
++    found = rows(engine, 'model_runs', 'SELECT model_type FROM model_runs WHERE run_id=?', (run_id,))
++    return len(found) == 1 and found[0]['model_type'] == 'nn'
++
++def cached(engine, identity):
++    found = rows(engine, 'final_evaluations', "SELECT * FROM final_evaluations WHERE active_identity=? AND status='succeeded'", (identity,))
++    if len(found) > 1:
++        raise ValueError('Duplicate active evaluation identity')
++    return found[0] if found else None
++
++def record(engine, identity):
++    found = rows(engine, 'final_evaluations', 'SELECT * FROM final_evaluations WHERE evaluation_id=?', (identity,))
++    return found[0] if len(found) == 1 else None
++
++def exposure_warnings(engine, p):
++    silver = p.spec.expected_silver_dataset_version_id
++    result = [{'source': 'evaluation_registry', **r} for r in rows(engine, 'final_evaluations', 'SELECT evaluation_id,holdout_fingerprint,accessed_at FROM final_evaluations WHERE silver_id=? AND accessed_at IS NOT NULL ORDER BY started_at,evaluation_id', (silver,))]
++    result.extend(({'source': 'legacy_or_parent_timestamp', 'run_id': r['run_id'], 'accessed_at': r['holdout_evaluated_at']} for r in rows(engine, 'model_runs', 'SELECT run_id,holdout_evaluated_at FROM model_runs WHERE silver_dataset_version_id=? AND holdout_evaluated_at IS NOT NULL ORDER BY started_at DESC', (silver,))))
++    return result
++
++def prepare_nn_evaluation(engine, spec, **roots):
++    unit = spec.target_unit
++    if not isinstance(unit, str) or not unit.strip() or unit.strip() in {'target units', 'target_units'}:
++        raise ValueError('NN evaluation requires explicit target units')
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.evaluation.regression_inputs import prepare_nn_regression_predictor_inputs
++    from ml_template.evaluation.regression_postprocessing import attach
++    raw = RegressionEvaluationConfig.model_validate({**spec.model_dump(mode='json'), 'calibration_id': None, 'release_variant': 'raw', 'uncertainty': {'enabled': False}})
++    p = prepare_nn_regression_predictor_inputs(engine, raw, **roots)
++    if p.provenance['versions'].get('torch') in {None, 'not-installed'}:
++        raise RuntimeError('Install the pytorch extra before NN evaluation; no holdout access occurred')
++    resolved = {**spec.model_dump(mode='json'), **{k: getattr(p.spec, k) for k in ['expected_silver_dataset_version_id', 'expected_feature_set_id', 'expected_split_id']}}
++    p.spec = RegressionEvaluationConfig.model_validate(resolved)
++    p.provenance = copy.deepcopy(p.provenance)
++    if p.spec.calibration_id is not None:
++        attach(engine, p.spec, p.provenance)
++    p.provenance['nn_evaluation_schema'] = 1
++    p.identity_hash = digest({'spec': p.spec.model_dump(mode='json'), 'provenance': p.provenance})
++    p.purpose = 'nn_evaluation'
++    return p
++
++def load_authorized_holdout(engine, p, evaluation_id):
++    cfg = p.spec
++    item = record(engine, evaluation_id)
++    locks = rows(engine, 'final_evaluation_locks', 'SELECT evaluation_id FROM final_evaluation_locks WHERE silver_id=? AND evaluation_id=?', (cfg.expected_silver_dataset_version_id, evaluation_id))
++    if getattr(p, 'purpose', None) != 'nn_evaluation' or not item or item['status'] != 'running' or (not item.get('accessed_at')) or (item['parent_run_id'] != cfg.parent_run_id) or (item['identity_hash'] != p.identity_hash) or (item['active_identity'] != p.identity_hash) or (item['holdout_fingerprint'] != p.fingerprint) or (len(locks) != 1) or (json.loads(item['spec_json']) != cfg.model_dump(mode='json')):
++        raise ValueError('NN holdout requires committed matching access and active dataset lock')
++    expected = p.assignments.loc[p.assignments.partition.eq('holdout'), p.key_col].sort_values(kind='stable').tolist()
++    if p.hold_keys != expected:
++        raise ValueError('NN holdout key inventory differs')
++    from ml_template.features.prepared_recipe import load_partition
++    X, y = load_partition(p, expected)
++    return (X, y.to_numpy(float))
++
++def verify_cache(engine, item, identity):
++    data = read_document(item['artifact_dir'])
++    stored = rows(engine, 'final_evaluation_metrics', 'SELECT result_json FROM final_evaluation_metrics WHERE evaluation_id=?', (item['evaluation_id'],))
++    validate_report(data, item, [json.loads(r['result_json']) for r in stored])
++    if item['identity_hash'] != identity:
++        raise ValueError('Cached NN identity differs')
++    return data
++
++def validate_output(p, root):
++    from ml_template.paths import ARTIFACTS_RUNS
++    root = Path(root).resolve()
++    if any((root.is_relative_to(Path(v).resolve()) for v in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()])):
++        raise ValueError('NN output cannot be inside source/run artifacts')
++    if any(((parent / name).is_file() for parent in [root, *root.parents] for name in ['artifact_manifest.json', 'manifest.json', 'artifacts.json', 'release.json'])):
++        raise ValueError('NN output cannot be inside sealed artifacts')
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--config', required=True, type=Path)
++    parser.add_argument('--database', type=Path)
++    parser.add_argument('--output-root', type=Path)
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument('--check', action='store_true')
++    mode.add_argument('--execute', action='store_true')
++    args = parser.parse_args(argv)
++    import yaml
++
++    class UniqueLoader(yaml.SafeLoader):
++        pass
++
++    def mapping(loader, node, deep=False):
++        result = {}
++        for k, v in node.value:
++            key = loader.construct_object(k, deep=deep)
++            if key in result:
++                raise ValueError('Duplicate evaluation YAML key')
++            result[key] = loader.construct_object(v, deep=deep)
++        return result
++    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.evaluation.evaluate_run import evaluate_spec
++    from ml_template.paths import DATABASE
++    from sqlalchemy import create_engine
++    spec = RegressionEvaluationConfig.model_validate(yaml.load(args.config.read_text(), Loader=UniqueLoader))
++    path = (args.database if args.database is not None else DATABASE).expanduser().resolve()
++    if not path.is_file():
++        raise FileNotFoundError(path)
++    db_mode = 'ro' if args.check else 'rw'
++    engine = create_engine('sqlite://', creator=lambda: sqlite3.connect(path.as_uri() + '?mode=' + db_mode, uri=True))
++    try:
++        if not is_nn_parent(engine, spec.parent_run_id):
++            raise ValueError('NN CLI requires registered NN parent')
++        print(json.dumps(evaluate_spec(engine, spec, check_only=args.check, output_root=args.output_root), indent=2, allow_nan=False))
++    finally:
++        engine.dispose()
++if __name__ == '__main__':
++    main()
+diff --git a/tests/evaluation/test_nn_lifecycle_03.py b/tests/evaluation/test_nn_lifecycle_03.py
+new file mode 100644
+--- /dev/null
++++ b/tests/evaluation/test_nn_lifecycle_03.py
+@@ -0,0 +1,185 @@
++"""Pure frozen NN evidence and read-only authorization contracts."""
++import copy
++import json
++import sqlite3
++import sys
++import types
++from types import SimpleNamespace
++import numpy as np
++import pandas as pd
++import pytest
++from ml_template.evaluation import nn_evaluate as nn
++from ml_template.tracking import nn_evaluation_contract as c
++
++def evidence(method=None):
++    d = {'schema_version': 3, 'task': 'regression', 'prediction_kind': 'continuous', 'model_type': 'nn', 'kind': 'final', 'weighting': 'equal', 'fitted_features': False, 'serialization': {'format': 'torch', 'weights_only': True, 'checkpoint_version': 1, 'preprocessing': 'embedded'}, 'members': [{'fold_id': None, 'model_path': 'model.ubj', 'transformer_path': None, 'weight': 1.0}], 'files_sha256': {k: '0' * 64 for k in ['model.ubj', 'config.json', 'features.json']}, 'training_rows': {'model.ubj': 20}}
++    fp = c.digest({'silver': 'silver_test', 'key': 'id', 'members': [json.dumps(['int', v]) for v in [10, 11, 12]]})
++    cfg = {'schema_version': 2, 'task': 'regression', 'parent_run_id': 'run_test', 'predictor': {'kind': 'final'}, 'primary_metric': 'rmse', 'expected_silver_dataset_version_id': 'silver_test', 'expected_split_id': 'split_test', 'expected_feature_set_id': None, 'target_unit': 'MPa', 'release_variant': 'raw', 'calibration_id': None, 'uncertainty': {'enabled': False}, 'criteria': []}
++    p = {'nn_evaluation_schema': 1, 'predictor': d, 'input_hashes': {}, 'code_hashes': {}, 'feature_preparation': {}, 'versions': {}, 'python': 'fixture', 'holdout_fingerprint': fp}
++    raw = np.array([-1.0, 0.0, 2.0])
++    point = raw.copy()
++    if method is not None:
++        correction = {'method': method, 'slope': 2.0 if method == 'affine' else 1.0, 'intercept': 0.0 if method == 'none' else 1.0}
++        cfg.update(calibration_id='regcal_test', release_variant='raw' if method == 'none' else 'recalibrated', uncertainty={'enabled': True, 'coverages': [0.8]})
++        state = {'schema_version': 1, 'calibration_id': 'regcal_test', 'holdout_labels_loaded': False, 'config': {'model_type': 'nn', 'parent_run_id': 'run_test', 'predictor_kind': 'final', 'target_unit': 'MPa', 'correction': method, 'coverages': [0.8]}, 'binding': c.prediction_binding(p), 'parameters': {'schema_version': 1, 'correction': correction, 'n_calibration': 9, 'quantiles': {'c800000': {'coverage': 0.8, 'rank': 8, 'half_width': 2.0}}}}
++        state['payload_sha256'] = c.digest(state)
++        p['postprocessing'] = {'state': state, 'calibration_id': 'regcal_test', 'sha256': '1' * 64}
++        p['input_hashes']['regression_calibration'] = '1' * 64
++        point = raw * correction['slope'] + correction['intercept']
++    frame = pd.DataFrame({'id': [10, 11, 12], 'y_true': point + [1.0, 1.0, -1.0], 'y_pred': point, 'y_pred_raw': raw, 'residual': [1.0, 1.0, -1.0], 'absolute_error': [1.0, 1.0, 1.0]})
++    if method is not None:
++        frame['pi_lower_c800000'] = point - 2
++        frame['pi_upper_c800000'] = point + 2
++    metrics = [{'variant': cfg['release_variant'], 'metric': k, 'value': v, 'direction': direction, 'status': 'defined', 'uncertainty': 'not_requested'} for k, v, direction in [('rmse', 1.0, 'min'), ('mae', 1.0, 'min'), ('r2', -0.5, 'max')]]
++    if method is not None:
++        metrics += [{'variant': cfg['release_variant'], 'metric': k + '_c800000', 'value': v, 'direction': 'diagnostic', 'status': 'defined', 'uncertainty': 'split_conformal_prediction_interval'} for k, v in [('empirical_coverage', 1.0), ('mean_width', 4.0)]]
++    identity = c.digest({'spec': cfg, 'provenance': p})
++    summary = {'model_type': 'nn', 'nn_evaluation_schema': 1, 'task': 'regression', 'automatic_promotion': False, 'n_rows': 3, 'evaluation_id': 'eval_test', 'parent_run_id': 'run_test', 'identity_hash': identity, 'predictor_kind': 'final', 'release_variant': cfg['release_variant'], 'calibration_id': cfg['calibration_id'], 'target_unit': 'MPa', 'interval_coverages': [0.8] if method is not None else [], 'criteria_status': 'not_assessed', 'primary_metric': 'rmse', 'primary_metric_direction': 'min', 'primary_value': 1.0, 'prior_exposure': False}
++    data = {'summary': summary, 'spec': cfg, 'provenance': p, 'metrics': metrics, 'acceptance': {'status': 'not_assessed', 'results': [], 'automatic_promotion': False}, 'residual_summary': {'mean': 1 / 3}, 'prior_exposures': []}
++    record = {'status': 'succeeded', 'accessed_at': 'recorded', 'evaluation_id': 'eval_test', 'parent_run_id': 'run_test', 'identity_hash': identity, 'silver_id': 'silver_test', 'holdout_fingerprint': fp, 'calibration_id': cfg['calibration_id'], 'spec_json': json.dumps(cfg), 'prior_json': '[]'}
++    return (data, record, frame)
++
++@pytest.mark.parametrize('method', [None, 'none', 'bias', 'affine'])
++def test_frozen_report_and_predictions(method):
++    data, record, frame = evidence(method)
++    c.validate_report(data, record, copy.deepcopy(data['metrics']))
++    c.validate_predictions(frame, data)
++
++@pytest.mark.parametrize('kind', ['status', 'access', 'identity', 'unit', 'metrics', 'promotion', 'marker', 'descriptor', 'duplicate', 'prior'])
++def test_invalid_evidence(kind):
++    data, record, _ = evidence()
++    stored = copy.deepcopy(data['metrics'])
++    if kind == 'status':
++        record['status'] = 'running'
++    elif kind == 'access':
++        record['accessed_at'] = None
++    elif kind == 'identity':
++        record['identity_hash'] = 'wrong'
++    elif kind == 'unit':
++        data['summary']['target_unit'] = 'wrong'
++    elif kind == 'metrics':
++        stored[0]['value'] = 99.0
++    elif kind == 'promotion':
++        data['summary']['automatic_promotion'] = True
++    elif kind == 'marker':
++        data['summary']['nn_evaluation_schema'] = True
++    elif kind == 'descriptor':
++        data['provenance']['predictor']['members'][0]['weight'] = 0.5
++    elif kind == 'duplicate':
++        data['metrics'].append(copy.deepcopy(data['metrics'][0]))
++    else:
++        record['prior_json'] = '[{"source":"other"}]'
++    with pytest.raises(ValueError):
++        c.validate_report(data, record, stored)
++
++@pytest.mark.parametrize('kind', ['unit', 'rank', 'width', 'payload', 'unselected', 'disabled_levels'])
++def test_bad_interval_state(kind):
++    data, _, _ = evidence('bias')
++    state = data['provenance']['postprocessing']['state']
++    if kind == 'unit':
++        state['config']['target_unit'] = 'wrong'
++    elif kind == 'rank':
++        state['parameters']['quantiles']['c800000']['rank'] = 7
++    elif kind == 'width':
++        state['parameters']['quantiles']['c800000']['half_width'] = -1
++    elif kind == 'payload':
++        state['payload_sha256'] = 'bad'
++    elif kind == 'unselected':
++        data['spec']['uncertainty']['coverages'] = [0.9]
++    else:
++        data['spec']['uncertainty']['enabled'] = False
++    if kind in ['unit', 'rank', 'width']:
++        state['payload_sha256'] = c.digest({k: v for k, v in state.items() if k != 'payload_sha256'})
++    with pytest.raises(ValueError):
++        c.interval_state(data['spec'], data['provenance'])
++
++@pytest.mark.parametrize('kind', ['keys', 'duplicate', 'residual', 'point', 'bounds', 'nan', 'extra', 'missing_raw'])
++def test_prediction_integrity(kind):
++    data, _, frame = evidence('bias')
++    if kind == 'keys':
++        frame.loc[0, 'id'] = 99
++    elif kind == 'duplicate':
++        frame.loc[0, 'id'] = 11
++    elif kind == 'residual':
++        frame.loc[0, 'residual'] = 99.0
++    elif kind == 'point':
++        frame.loc[0, 'y_pred_raw'] = 99.0
++    elif kind == 'bounds':
++        frame.loc[0, 'pi_lower_c800000'] -= 1
++    elif kind == 'nan':
++        frame.loc[0, 'y_true'] = np.nan
++    elif kind == 'extra':
++        frame['unexpected'] = 1
++    else:
++        frame = frame.drop(columns='y_pred_raw')
++    with pytest.raises(ValueError):
++        c.validate_predictions(frame, data)
++
++@pytest.mark.parametrize('name', ['../escape', '/absolute', 'x/../y', 'x\\y', ''])
++def test_paths(tmp_path, name):
++    with pytest.raises(ValueError):
++        c.safe(tmp_path, name)
++
++def test_no_ddl_in_metadata_reads():
++    connection = sqlite3.connect(':memory:')
++    assert nn.cached(connection, 'x') is None and nn.record(connection, 'x') is None
++    assert connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall() == []
++    connection.close()
++
++@pytest.mark.parametrize('case', ['not_accessed', 'no_lock', 'wrong_identity', 'wrong_keys', 'wrong_purpose', 'authorized'])
++def test_committed_authorization(case, monkeypatch):
++    connection = sqlite3.connect(':memory:')
++    connection.execute('CREATE TABLE final_evaluations (evaluation_id TEXT,status TEXT,accessed_at TEXT,parent_run_id TEXT,identity_hash TEXT,active_identity TEXT,holdout_fingerprint TEXT,spec_json TEXT)')
++    connection.execute('CREATE TABLE final_evaluation_locks (silver_id TEXT,evaluation_id TEXT)')
++    payload = {'parent_run_id': 'run_test', 'expected_silver_dataset_version_id': 'silver_test'}
++    spec = SimpleNamespace(**payload)
++    spec.model_dump = lambda **kwargs: payload.copy()
++    connection.execute('INSERT INTO final_evaluations VALUES (?,?,?,?,?,?,?,?)', ('eval', 'running', None if case == 'not_accessed' else 'committed', 'run_test', 'identity', 'identity', 'population', json.dumps(payload)))
++    if case != 'no_lock':
++        connection.execute("INSERT INTO final_evaluation_locks VALUES ('silver_test','eval')")
++    connection.commit()
++    p = SimpleNamespace(spec=spec, purpose='predictor_only' if case == 'wrong_purpose' else 'nn_evaluation', identity_hash='bad' if case == 'wrong_identity' else 'identity', fingerprint='population', key_col='id', hold_keys=[10, 11, 99] if case == 'wrong_keys' else [10, 11, 12], assignments=pd.DataFrame({'id': [10, 11, 12], 'partition': ['holdout'] * 3}))
++    seen = []
++    module = types.ModuleType('ml_template.features.prepared_recipe')
++
++    def load(prepared, keys):
++        seen.append(keys)
++        return (pd.DataFrame({'x': [1.0, 2.0, 3.0]}, index=keys), pd.Series([1.0, 2.0, 3.0], index=keys))
++    module.load_partition = load
++    monkeypatch.setitem(sys.modules, 'ml_template.features.prepared_recipe', module)
++    if case == 'authorized':
++        _, y = nn.load_authorized_holdout(connection, p, 'eval')
++        assert y.tolist() == [1.0, 2.0, 3.0] and seen == [[10, 11, 12]]
++    else:
++        with pytest.raises(ValueError):
++            nn.load_authorized_holdout(connection, p, 'eval')
++        assert not seen
++    connection.close()
++
++def test_calibration_binding_unchanged_by_evaluator_files():
++    data, _, _ = evidence()
++    p = data['provenance']
++    binding = c.prediction_binding(p)
++    p['code_hashes'].update({'evaluation/nn_evaluate.py': 'new', 'evaluation/regression_evaluate.py': 'new', 'tracking/nn_evaluation_contract.py': 'new', 'dashboard/regression_multi_data.py': 'new'})
++    assert c.prediction_binding(p) == binding
++
++def write_document(root):
++    data, _, _ = evidence()
++    for key in ['summary', 'spec', 'provenance', 'acceptance', 'residual_summary']:
++        (root / (key + '.json')).write_text(json.dumps(data[key]))
++    (root / 'report_data.json').write_text(json.dumps(data))
++    for name in ['metrics.csv', 'report.html', 'holdout_predictions.parquet']:
++        (root / name).write_bytes(b'hash-only test fixture; no Parquet decoding')
++    entries = {p.name: {'sha256': c.sha256(p), 'bytes': p.stat().st_size} for p in root.iterdir()}
++    (root / 'artifact_manifest.json').write_text(json.dumps({'files': entries}))
++    return data
++
++def test_hash_only_metadata_verification(tmp_path):
++    data = write_document(tmp_path)
++    assert c.read_document(tmp_path) == data
++
++def test_corrupt_frozen_predictions_rejected_before_decode(tmp_path):
++    write_document(tmp_path)
++    (tmp_path / 'holdout_predictions.parquet').write_bytes(b'changed')
++    with pytest.raises(ValueError):
++        c.read_document(tmp_path)
+diff --git a/tests/evaluation/test_nn_lifecycle_03_native.py b/tests/evaluation/test_nn_lifecycle_03_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/evaluation/test_nn_lifecycle_03_native.py
+@@ -0,0 +1,139 @@
++"""Real CPU NN frozen evaluation; reuses accepted Package 01 synthetic fixture."""
++import importlib.util
++import json
++import sys
++from pathlib import Path
++import numpy as np
++import pandas as pd
++import pytest
++_path = Path(__file__).parents[1] / 'models' / 'test_nn_lifecycle_01_native.py'
++_spec = importlib.util.spec_from_file_location('nn_package_03_training_fixture', _path)
++_module = importlib.util.module_from_spec(_spec)
++sys.modules[_spec.name] = _module
++_spec.loader.exec_module(_module)
++trained = _module.trained
++
++def request_for(trained, **extra):
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    return RegressionEvaluationConfig(**{'parent_run_id': trained['rid'], 'target_unit': 'synthetic_units', 'intended_use': 'Synthetic NN evaluation only', **extra})
++
++def in_memory_holdout(p, trained):
++    from ml_template.features.prepared_recipe import prepare_frame
++    plan = p.provenance['feature_preparation']
++    f = trained['df'].set_index('id').loc[p.hold_keys]
++    return (prepare_frame(f[plan['recipe']['raw_columns']], plan['recipe'], plan['model_schema']), f.y.to_numpy(float))
++
++@pytest.mark.parametrize('kind', ['final', 'cv_mean'])
++@pytest.mark.parametrize('variant', ['raw', 'intervals', 'bias_intervals', 'affine_intervals', 'bias_only'])
++def test_native_frozen_nn(trained, tmp_path, monkeypatch, kind, variant):
++    from ml_template.evaluation.evaluate_run import evaluate_spec
++    from ml_template.evaluation import nn_evaluate as nn
++    from ml_template.models.nn_regressor import NNRegressionAdapter
++    from ml_template.models.predictor_selection import load_evaluation_predictor
++    from ml_template.models.regression_postprocessing import apply
++    from ml_template.preprocessing.nn_preprocessor import NNPreprocessor
++    from ml_template.training.regression_calibration import CalibrationConfig, calibrate
++    from ml_template.db import evaluation_registry as registry
++    correction = 'none' if variant in ['raw', 'intervals'] else variant.split('_')[0]
++    coverages = [] if variant in ['raw', 'bias_only'] else [0.8]
++    stage = {'value': 'calibrate'}
++    reads = []
++    allowed = {role: set(trained['assignment'].loc[trained['assignment'].partition.eq(role), 'id']) for role in ['dev', 'holdout', 'calibration', 'recalibration']}
++    old_read = pd.read_parquet
++
++    def spy(path, *args, **kwargs):
++        if Path(path) == trained['parquet']:
++            keys = set(kwargs['filters'][0][2])
++            if stage['value'] == 'calibrate':
++                assert keys in [allowed['calibration'], allowed['recalibration']]
++            else:
++                assert stage['value'] == 'evaluate' and keys == allowed['holdout']
++                assert not keys & (allowed['dev'] | allowed['calibration'] | allowed['recalibration'])
++                record = nn.rows(trained['engine'], 'final_evaluations', "SELECT * FROM final_evaluations WHERE status='running'")
++                assert len(record) == 1 and record[0]['accessed_at']
++                assert nn.rows(trained['engine'], 'final_evaluation_locks', 'SELECT * FROM final_evaluation_locks')
++                reads.append(keys)
++        return old_read(path, *args, **kwargs)
++    monkeypatch.setattr(pd, 'read_parquet', spy)
++    monkeypatch.setattr(NNPreprocessor, 'fit', lambda *a, **k: pytest.fail('fitted Gold during evaluation'))
++    monkeypatch.setattr(NNRegressionAdapter, '_train', lambda *a, **k: pytest.fail('trained NN during evaluation'))
++    calibration_id = None
++    if variant != 'raw':
++        fitted = calibrate(trained['engine'], CalibrationConfig(model_type='nn', parent_run_id=trained['rid'], predictor_kind=kind, correction=correction, coverages=coverages, target_unit='synthetic_units', min_calibration_rows=5, min_recalibration_rows=3, intended_use='Synthetic only'), check_only=False, output_root=tmp_path / 'calibrations', **trained['roots'])
++        calibration_id = fitted['calibration_id']
++    spec = request_for(trained, predictor={'kind': kind}, calibration_id=calibration_id, release_variant='raw' if correction == 'none' else 'recalibrated', uncertainty={'enabled': bool(coverages), 'coverages': coverages}, criteria=[{'metric': 'rmse', 'operator': '<=', 'value': 1e+100}])
++    stage['value'] = 'check'
++    old_load = trained['torch'].load
++    monkeypatch.setattr(trained['torch'], 'load', lambda *a, **k: pytest.fail('check deserialized a checkpoint'))
++    output = tmp_path / 'nn_evaluations'
++    before = trained['sha256'](tmp_path / 'project.db')
++    checked = evaluate_spec(trained['engine'], spec, check_only=True, output_root=output, **trained['roots'])
++    assert checked['ready'] and (not checked['models_loaded']) and (not checked['holdout_labels_loaded'])
++    assert not checked['files_written'] and (not output.exists()) and (not reads)
++    assert before == trained['sha256'](tmp_path / 'project.db')
++    monkeypatch.setattr(trained['torch'], 'load', old_load)
++    stage['value'] = 'evaluate'
++    result = evaluate_spec(trained['engine'], spec, output_root=output, **trained['roots'])
++    assert result['holdout_labels_loaded'] and (not result['release_enabled']) and (len(reads) == 1)
++    assert result['summary']['criteria_status'] == 'passed' and result['summary']['automatic_promotion'] is False
++    p = nn.prepare_nn_evaluation(trained['engine'], spec, **trained['roots'])
++    X, y = in_memory_holdout(p, trained)
++    raw = load_evaluation_predictor(p).predict(X)
++    point, bounds = (raw, {})
++    if calibration_id:
++        point, bounds = apply(raw, p.provenance['postprocessing']['state']['parameters'], coverages)
++    assert result['summary']['primary_value'] == pytest.approx(float(np.sqrt(np.mean((y - point) ** 2))))
++    frame = old_read(Path(result['artifact_dir']) / 'holdout_predictions.parquet')
++    assert set(frame.id) == allowed['holdout']
++    np.testing.assert_allclose(frame.y_pred_raw, raw, rtol=0, atol=1e-06)
++    np.testing.assert_allclose(frame.y_pred, point, rtol=0, atol=1e-06)
++    for name, values in bounds.items():
++        np.testing.assert_allclose(frame[name], values, rtol=0, atol=1e-06)
++    stage['value'] = 'saved'
++    monkeypatch.setattr(trained['torch'], 'load', lambda *a, **k: pytest.fail('cache/UI loaded a model'))
++    cached = evaluate_spec(trained['engine'], spec, output_root=output, **trained['roots'])
++    assert cached['cached'] and cached['evaluation_id'] == result['evaluation_id'] and (not cached['holdout_labels_loaded']) and (len(reads) == 1)
++    from ml_template.dashboard.regression_multi_data import load_regression_evaluation
++    metadata = load_regression_evaluation(trained['engine'], result['evaluation_id'], predictions=False)
++    assert metadata['state'] == 'verified', metadata
++    assert metadata['predictions'] is None
++    saved = load_regression_evaluation(trained['engine'], result['evaluation_id'], predictions=True)
++    assert saved['state'] == 'verified', saved
++    assert len(saved['predictions']) == len(allowed['holdout']) and len(reads) == 1
++    assert not registry.query(trained['engine'], 'SELECT * FROM final_evaluation_locks')
++    revised = spec.model_copy(update={'intended_use': 'Revised synthetic protocol'})
++    assert not evaluate_spec(trained['engine'], revised, check_only=True, **trained['roots'])['ready']
++    with pytest.raises(ValueError, match='previously exposed'):
++        evaluate_spec(trained['engine'], revised, output_root=output, **trained['roots'])
++    from ml_template.evaluation.regression_inputs import prepare_regression
++    with pytest.raises(ValueError, match='Expected XGB'):
++        prepare_regression(trained['engine'], spec, **trained['roots'])
++    (Path(result['artifact_dir']) / 'metrics.csv').write_text('tampered')
++    with pytest.raises(ValueError):
++        evaluate_spec(trained['engine'], spec, **trained['roots'])
++
++def test_native_failed_load_keeps_access(trained, tmp_path):
++    from ml_template.evaluation.evaluate_run import evaluate_spec
++    from ml_template.db import evaluation_registry as registry
++
++    def bad(*args, **kwargs):
++        raise RuntimeError('synthetic NN load failure')
++    with pytest.raises(RuntimeError, match='synthetic NN load failure'):
++        evaluate_spec(trained['engine'], request_for(trained), output_root=tmp_path / 'failed', adapter_loader=bad, **trained['roots'])
++    rows = registry.query(trained['engine'], 'SELECT status,accessed_at,active_identity FROM final_evaluations')
++    assert len(rows) == 1 and rows[0]['status'] == 'failed' and rows[0]['accessed_at'] and (rows[0]['active_identity'] is None)
++    assert not registry.query(trained['engine'], 'SELECT * FROM final_evaluation_locks')
++
++def test_native_bad_request_no_targets(trained, monkeypatch):
++    from ml_template.evaluation.evaluate_run import evaluate_spec
++    old = pd.read_parquet
++
++    def spy(path, *args, **kwargs):
++        if Path(path) == trained['parquet']:
++            pytest.fail('invalid request read source values')
++        return old(path, *args, **kwargs)
++    monkeypatch.setattr(pd, 'read_parquet', spy)
++    with pytest.raises(ValueError, match='target units'):
++        evaluate_spec(trained['engine'], request_for(trained, target_unit=None), check_only=True, **trained['roots'])
++    with pytest.raises(ValueError, match='inside source/run'):
++        evaluate_spec(trained['engine'], request_for(trained), output_root=trained['root'], **trained['roots'])
+diff --git a/configs/evaluation/concrete_nn_package_03_raw.yaml b/configs/evaluation/concrete_nn_package_03_raw.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/evaluation/concrete_nn_package_03_raw.yaml
+@@ -0,0 +1,21 @@
++# Freeze before final-label access. This is research-only on previously exposed concrete.
++schema_version: 2
++task: regression
++parent_run_id: run_20261111_135508_ccf0e8
++predictor:
++  kind: final
++primary_metric: rmse
++target_unit: MPa
++expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
++expected_feature_set_id: null
++expected_split_id: split_841e3a09cb9d
++calibration_id: null
++release_variant: raw
++uncertainty:
++  enabled: false
++criteria: []
++intended_use: "Exploratory NN evaluation; not independent deployment evidence"
++limitations:
++  - "Prior exposure cannot be erased by acknowledgement."
++acknowledge_prior_exposure: false
++prior_exposure_note: ""
+diff --git a/configs/evaluation/concrete_nn_package_03_intervals.example.yaml b/configs/evaluation/concrete_nn_package_03_intervals.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/evaluation/concrete_nn_package_03_intervals.example.yaml
+@@ -0,0 +1,20 @@
++# Replace ID with the actual bound Package 02 calibration. Not a comparison sweep.
++schema_version: 2
++task: regression
++parent_run_id: run_20261111_135508_ccf0e8
++predictor:
++  kind: final
++primary_metric: rmse
++target_unit: MPa
++expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
++expected_split_id: split_841e3a09cb9d
++calibration_id: regcal_REPLACE_WITH_PACKAGE02_ID
++# raw for correction:none; recalibrated for a bound bias/affine correction.
++release_variant: raw
++uncertainty:
++  enabled: true
++  coverages: [0.9]
++criteria: []
++intended_use: "Exploratory NN intervals; no automatic deployment approval"
++acknowledge_prior_exposure: false
++prior_exposure_note: ""

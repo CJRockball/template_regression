@@ -1,0 +1,25 @@
+# Freeze before final-label access. This is research-only on previously exposed concrete.
+schema_version: 2
+task: regression
+parent_run_id: run_20261111_135508_ccf0e8
+predictor:
+  kind: final
+primary_metric: rmse
+target_unit: MPa
+expected_silver_dataset_version_id: silver_concrete_v1_6fe40821
+expected_feature_set_id: null
+expected_split_id: split_841e3a09cb9d
+calibration_id: null
+release_variant: raw
+uncertainty:
+  enabled: false
+criteria: []
+intended_use: "Exploratory NN evaluation; not independent deployment evidence"
+limitations:
+  - "Prior exposure cannot be erased by acknowledgement."
+acknowledge_prior_exposure: true
+prior_exposure_note: >-
+  This Silver dataset has recorded prior final-holdout access. This run
+  reuses the dataset to demonstrate the pipeline. Newly reserved partitions
+  do not erase prior data use. Results will be treated as exploratory,
+  without claiming an untouched final assessment.
