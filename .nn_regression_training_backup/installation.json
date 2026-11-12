@@ -1,0 +1,46 @@
+{
+  "src/ml_template/models/nn/params.py": {
+    "before": "6f95d94417884408a555e80e54de8d00f91d121b6bf776ee877d8f5976f37447",
+    "after": "4a772a40d56b775313f8d4ea67e8243eeb32f10dccab288da1134ed354a456ff"
+  },
+  "src/ml_template/models/model_factory.py": {
+    "before": "5af2a31a46e4ed01db50df638dc9d354cc1be1fac72f611672c2902200cac1e3",
+    "after": "b154a70566718e49e74b906129e8c3b6d304c0c41137a5a2c14d490dd57b2c78"
+  },
+  "src/ml_template/training/run_config.py": {
+    "before": "5a13640f8dbd8499f514a64fc3e64de811ef24ad9632082565e73929a49f70a6",
+    "after": "0e32ee2f4631a5570c32608c86e22d7aaab27683dfb1264e2a2a8aa90ece37a9"
+  },
+  "src/ml_template/models/nn/regression.py": {
+    "before": null,
+    "after": "e803b5f6f91052c80205429f7f6cf4850bd72c9947a8c25cf3b3f3fdbbf2e749"
+  },
+  "src/ml_template/models/nn/regression_engine.py": {
+    "before": null,
+    "after": "e95be768d52df7f6580c6889a334544e1078ba845469744b62d377c6c51275f5"
+  },
+  "src/ml_template/models/nn_regressor.py": {
+    "before": null,
+    "after": "2b8853101bee3977d9fae3019aed364d5df5ec3280d8ba9e57ccbfc33c2a6889"
+  },
+  "tests/models/test_nn_regression_core.py": {
+    "before": null,
+    "after": "5d13ef56f875de2e24691d3bc41e31d21ee1d55263c85d349493d42210a2d970"
+  },
+  "tests/models/test_nn_regression_native.py": {
+    "before": null,
+    "after": "a3d73f21c6afe66414a9e4364b69af4097350c440025458956260fc1b1df6b9f"
+  },
+  "tests/training/test_nn_regression_config.py": {
+    "before": null,
+    "after": "12fa48a038e7ac0fa540935ddffbf9099f391f371cf4997f1dde0f0542360275"
+  },
+  "tests/training/test_nn_regression_training_native.py": {
+    "before": null,
+    "after": "0f1344b7652809a11da50396cd2292f2b71e085030177feb8b6629d57ee35717"
+  },
+  "configs/experiment/concrete_nn_regression.example.yaml": {
+    "before": null,
+    "after": "ebf5b638a90314370a87758dddd129729b51bac6b7ca65f7b1f9804513343634"
+  }
+}

@@ -69,7 +69,16 @@ class NNParams(BaseModel):
         return self
 
 
+class NNRegressionParams(NNParams):
+    """Continuous-output MLP. Binary weighting is fixed and never used."""
+
+    task: Literal["regression"] = "regression"
+    loss: Literal["mse"] = "mse"
+    monitor: Literal["rmse", "mae"] = "rmse"
+    pos_weight: Literal[1.0] = 1.0
+
+
 class NNModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     type: Literal["nn"] = "nn"
-    params: NNParams = Field(default_factory=NNParams)
+    params: NNParams | NNRegressionParams = Field(default_factory=NNParams)

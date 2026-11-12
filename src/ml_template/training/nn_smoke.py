@@ -70,7 +70,10 @@ def _inputs(spec):
         X.loc[rng.random(n) < 0.15, "num_0"] = np.nan
         X.loc[rng.random(n) < 0.15, "cat_0"] = None
         cfg = SimpleNamespace(
-            model=NNModelConfig(params=params), seed=spec.seed, fitted_features=None
+            task="binary_classification",
+            model=NNModelConfig(params=params),
+            seed=spec.seed,
+            fitted_features=None,
         )
         return cfg, X, y
     from ml_template.data.contract import load_dataset_contract

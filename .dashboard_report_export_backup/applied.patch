@@ -1,0 +1,642 @@
+diff --git a/src/ml_template/dashboard/report_export.py b/src/ml_template/dashboard/report_export.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/dashboard/report_export.py
+@@ -0,0 +1,216 @@
++"""Memory-only reports from browser-rendered snapshots; never load models or datasets."""
++from __future__ import annotations
++
++import csv
++import hashlib
++import html
++import io
++import json
++import zipfile
++from datetime import UTC, datetime
++
++TABS = {"assets": "Assets", "sweeps": "Sweeps", "experiments": "Experiments",
++        "run": "Single run", "compare": "Compare", "calibration": "Calibration",
++        "evaluation": "Final evaluation"}
++MAX_BYTES = 12 * 1024 * 1024
++MAX_CELLS = 100000
++
++
++def canonical(value):
++    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
++
++
++def _text(value, limit=250000):
++    if not isinstance(value, str) or len(value) > limit:
++        raise ValueError("Invalid or oversized text")
++    return value
++
++
++def validate(snapshot):
++    if not isinstance(snapshot, dict):
++        raise ValueError("No browser snapshot")
++    if len(canonical(snapshot).encode()) > MAX_BYTES:
++        raise ValueError("Snapshot exceeds 12 MiB; reduce the selected view")
++    if type(snapshot.get("schema_version")) is not int or snapshot["schema_version"] != 1:
++        raise ValueError("Unsupported snapshot version")
++    if snapshot.get("active_tab") not in TABS:
++        raise ValueError("Unknown tab")
++    stamp = datetime.fromisoformat(_text(snapshot.get("captured_at"), 64).replace("Z", "+00:00"))
++    if stamp.tzinfo is None:
++        raise ValueError("Timestamp needs a timezone")
++    if type(snapshot.get("include_final_evaluation")) is not bool:
++        raise ValueError("Missing consent state")
++    if snapshot["active_tab"] == "evaluation" and not snapshot["include_final_evaluation"]:
++        raise ValueError("Explicitly allow visible Final evaluation content first")
++    controls = snapshot.get("controls", [])
++    if not isinstance(controls, list) or len(controls) > 250:
++        raise ValueError("Invalid control state")
++    for item in controls:
++        if not isinstance(item, dict):
++            raise ValueError("Invalid control")
++        for key in ("id", "kind", "value"):
++            _text(item.get(key, ""), 20000)
++    blocks = snapshot.get("blocks")
++    if not isinstance(blocks, list) or not 1 <= len(blocks) <= 800:
++        raise ValueError("No rendered content or too many blocks")
++    cells = 0
++    for block in blocks:
++        if not isinstance(block, dict):
++            raise ValueError("Invalid block")
++        kind = block.get("kind")
++        if kind in {"paragraph", "pre", "heading"}:
++            _text(block.get("text"))
++            if kind == "heading" and (type(block.get("level")) is not int or not 1 <= block["level"] <= 6):
++                raise ValueError("Invalid heading")
++        elif kind == "table":
++            rows = block.get("rows")
++            if not isinstance(rows, list) or not 1 <= len(rows) <= 10000:
++                raise ValueError("Invalid table")
++            _text(block.get("caption", ""), 1000)
++            for row in rows:
++                if not isinstance(row, list) or not row:
++                    raise ValueError("Invalid table row")
++                cells += len(row)
++                for cell in row:
++                    _text(cell)
++            if cells > MAX_CELLS:
++                raise ValueError("Displayed-cell limit exceeded")
++        elif kind == "figure":
++            fig = block.get("figure")
++            if (not isinstance(fig, dict) or set(fig) - {"data", "layout"}
++                    or not isinstance(fig.get("data"), list) or not isinstance(fig.get("layout"), dict)):
++                raise ValueError("Invalid figure")
++            remote = {"scattergeo", "choropleth", "scattermapbox", "choroplethmapbox",
++                      "densitymapbox", "scattermap", "choroplethmap", "densitymap"}
++            for trace in fig["data"]:
++                if not isinstance(trace, dict) or trace.get("type") in remote:
++                    raise ValueError("Offline reports do not support geographic/map traces")
++                if "source" in trace:
++                    _image(trace["source"])
++            template = fig["layout"].get("template", {})
++            if not isinstance(template, dict):
++                raise ValueError("Invalid figure template")
++            for layout in (fig["layout"], template.get("layout", {})):
++                if not isinstance(layout, dict) or not isinstance(layout.get("images", []), list):
++                    raise ValueError("Invalid layout images")
++                for image in layout.get("images", []):
++                    _image(image.get("source") if isinstance(image, dict) else None)
++        else:
++            raise ValueError("Unsupported report block")
++    return snapshot
++
++
++def _image(source):
++    if not isinstance(source, str) or not source.startswith(("data:image/png;base64,", "data:image/jpeg;base64,", "data:image/webp;base64,")):
++        raise ValueError("External images are not bundled; use embedded PNG/JPEG/WebP")
++
++
++def metadata(snapshot):
++    return {
++        "schema_version": 1, "exported_at": datetime.now(UTC).isoformat(),
++        "captured_at": snapshot["captured_at"], "active_tab": snapshot["active_tab"],
++        "controls": snapshot.get("controls", []),
++        "include_final_evaluation": snapshot["include_final_evaluation"],
++        "snapshot_sha256": hashlib.sha256(canonical(snapshot).encode()).hexdigest(),
++        "capture_kind": "rendered_current_tab", "underlying_data_reloaded": False,
++        "artifact_integrity_reverified": False,
++        "limitations": [
++            "Rendered UI snapshot, not a model artifact, verified provenance or deployment approval.",
++            "Tables retain displayed precision, pagination and row/column limits, not full source data.",
++            "Control values are displayed labels, not a machine-restorable selection state.",
++            "Hidden tabs, collapsed content and unrendered rows are excluded.",
++            "AG Grid column panes are separate; pinned-top/bottom rows are not captured.",
++            "Displayed figures include chart data, even legend-hidden traces; review before sharing.",
++            "Charts retain captured data/layout, not Dash callbacks, animation or hover state.",
++            "Maps/external images and external network requests are unsupported; LaTeX assets are not bundled.",
++            "Source artifact IDs/hashes are not independently recovered or reverified.",
++            "CSV formula-like text is apostrophe-prefixed; snapshot.json retains original displayed text.",
++        ],
++    }
++
++
++def script_json(value):
++    return (canonical(value).replace("<", "\\u003c").replace(">", "\\u003e")
++            .replace("&", "\\u0026").replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029"))
++
++
++def _render(snapshot, info):
++    escape = html.escape
++    parts, figures = [], []
++    for block in snapshot["blocks"]:
++        kind = block["kind"]
++        if kind == "heading":
++            tag = "h" + str(block["level"])
++            parts.append("<" + tag + ">" + escape(block["text"]) + "</" + tag + ">")
++        elif kind in {"paragraph", "pre"}:
++            tag = "pre" if kind == "pre" else "p"
++            parts.append("<" + tag + ">" + escape(block["text"]) + "</" + tag + ">")
++        elif kind == "table":
++            rows = "".join("<tr>" + "".join("<td>" + escape(cell) + "</td>" for cell in row) + "</tr>" for row in block["rows"])
++            parts.append("<h3>" + escape(block.get("caption", "Displayed table"))
++                         + "</h3><div class='scroll'><table>" + rows + "</table></div>")
++        else:
++            identifier = "report-figure-" + str(len(figures) + 1)
++            figures.append({"id": identifier, "figure": block["figure"]})
++            parts.append("<div class='figure' id='" + identifier + "'></div>")
++    charts = ""
++    if figures:
++        from plotly.offline import get_plotlyjs
++        charts = ("<script>" + get_plotlyjs() + "</script><script>const reportFigures="
++                  + script_json(figures) + ";reportFigures.forEach(function(x){"
++                  "Plotly.newPlot(x.id,x.figure.data,x.figure.layout,{responsive:true,displaylogo:false})"
++                  ".catch(function(e){document.getElementById(x.id).textContent='Chart unavailable: '+String(e);});});</script>")
++    controls = "".join("<tr><td>" + escape(c.get("id", "")) + "</td><td>"
++                       + escape(c.get("value", "")) + "</td></tr>" for c in info["controls"])
++    title = "Dashboard report — " + TABS[snapshot["active_tab"]]
++    csp = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; worker-src blob:; object-src 'none'; base-uri 'none'"
++    css = "body{font-family:system-ui,sans-serif;margin:28px;line-height:1.45}table{border-collapse:collapse}td{border:1px solid #ccc;padding:6px;vertical-align:top;white-space:pre-wrap}.scroll{overflow-x:auto}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f4f4;padding:12px}.figure{min-height:400px;width:100%}.notice{background:#edf5ff;padding:12px;border-left:4px solid #2673b8}"
++    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
++            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
++            '<meta http-equiv="Content-Security-Policy" content="' + escape(csp, quote=True) + '">'
++            "<title>" + escape(title) + "</title><style>" + css + "</style></head><body><h1>"
++            + escape(title) + "</h1><p>Captured: " + escape(info["captured_at"]) + "</p>"
++            "<div class='notice'>Read-only rendered snapshot, not new evaluation or full-precision source data.</div>"
++            "<h2>Selected controls — displayed labels</h2><table>" + controls + "</table><hr>"
++            + "".join(parts) + "<hr><h2>Scope and limitations</h2><ul>"
++            + "".join("<li>" + escape(t) + "</li>" for t in info["limitations"])
++            + "</ul><details><summary>Export metadata</summary><pre>"
++            + escape(json.dumps(info, ensure_ascii=False, indent=2)) + "</pre></details>"
++            + charts + "</body></html>")
++
++
++def build_html(snapshot):
++    snapshot = validate(snapshot)
++    return _render(snapshot, metadata(snapshot))
++
++
++def _csv_cell(value):
++    return "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) or value.startswith(("\t", "\r", "\n")) else value
++
++
++def build_bundle(snapshot):
++    snapshot = validate(snapshot)
++    info = metadata(snapshot)
++    members = {"report.html": _render(snapshot, info).encode(),
++               "metadata.json": json.dumps(info, ensure_ascii=False, indent=2).encode(),
++               "snapshot.json": json.dumps(snapshot, ensure_ascii=False, indent=2, allow_nan=False).encode()}
++    tables, figures = 0, 0
++    for block in snapshot["blocks"]:
++        if block["kind"] == "table":
++            tables += 1
++            stream = io.StringIO(newline="")
++            csv.writer(stream).writerows([[_csv_cell(c) for c in row] for row in block["rows"]])
++            members[f"tables/table_{tables:03d}.csv"] = ("\ufeff" + stream.getvalue()).encode()
++        elif block["kind"] == "figure":
++            figures += 1
++            members[f"figures/figure_{figures:03d}.json"] = canonical(block["figure"]).encode()
++    members["README.txt"] = ("Extract this bundle and open report.html in a browser. Plotly.js is embedded when charts exist.\n"
++        "Tables are rendered/rounded/limited text, not full source data. CSV formula-like cells have an apostrophe prefix.\n"
++        "snapshot.json preserves the displayed text. Metadata is not independently verified artifact provenance.\n"
++        "No models, database or source dataset are included. Treat chart/table data as potentially sensitive.\n").encode()
++    members["SHA256SUMS.json"] = json.dumps({n: hashlib.sha256(v).hexdigest() for n, v in members.items()}, indent=2).encode()
++    stream = io.BytesIO()
++    with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
++        for name, value in members.items():
++            archive.writestr(name, value)
++    return stream.getvalue()
+diff --git a/src/ml_template/dashboard/report_client.py b/src/ml_template/dashboard/report_client.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/dashboard/report_client.py
+@@ -0,0 +1,86 @@
++"""Inline clientside capture, packaged as Python so no assets configuration is needed."""
++
++CLIENTSIDE_CAPTURE = r'''
++function(htmlClicks, zipClicks, tab, consent) {
++    "use strict";
++    const ids={assets:"assets-container",sweeps:"sweeps-container",experiments:"experiments-container",run:"single-run-container",compare:"compare-container",calibration:"calibration-container",evaluation:"evaluation-container"};
++    const ctx=window.dash_clientside.callback_context || {};
++    const trigger=String(ctx.triggered_id || (((ctx.triggered||[])[0]||{}).prop_id)||"").split(".")[0];
++    if (!["report-export-html","report-export-zip"].includes(trigger)) return window.dash_clientside.no_update;
++    const format=trigger==="report-export-zip"?"zip":"html";
++    function visible(n) {
++        if (!n || n.nodeType!==1) return true;
++        const s=window.getComputedStyle(n);
++        return s.display!=="none" && s.visibility!=="hidden" && s.visibility!=="collapse" && s.opacity!=="0" && (s.display==="contents" || n.getClientRects().length>0);
++    }
++    function text(n) {
++        if(n.nodeType===3) return n.nodeValue||"";
++        if(n.nodeType!==1 || !visible(n) || ["SCRIPT","STYLE","NOSCRIPT","BUTTON","INPUT","SELECT","OPTION"].includes(n.tagName)) return "";
++        return Array.from(n.childNodes).map(text).join("");
++    }
++    function plain(v) {return JSON.parse(JSON.stringify(v,function(k,x){if(k.startsWith("_"))return undefined;if(ArrayBuffer.isView(x))return Array.from(x);if(typeof x==="bigint")throw new Error("BigInt chart data is unsupported");return x;}));}
++    try {
++        if(!Object.prototype.hasOwnProperty.call(ids,tab)) throw new Error("Unknown tab");
++        const allowed=Array.isArray(consent)&&consent.includes("allow_final_evaluation");
++        if(tab==="evaluation"&&!allowed) throw new Error("Explicitly allow exporting visible Final evaluation content first");
++        const root=document.getElementById(ids[tab]);
++        if(!root||!visible(root)) throw new Error("Selected view is not rendered; wait and retry");
++        if(root.matches('[data-dash-is-loading="true"]')||root.querySelector('[data-dash-is-loading="true"]')) throw new Error("View is still loading; wait and retry");
++        const blocks=[];let heading="",visited=0;
++        function grid(n) {
++            let captured=0;
++            [["center",".ag-center-cols-container",".ag-header-viewport"],["pinned left",".ag-pinned-left-cols-container",".ag-pinned-left-header"],["pinned right",".ag-pinned-right-cols-container",".ag-pinned-right-header"]].forEach(function(p){
++                const body=n.querySelector(p[1]),header=n.querySelector(p[2]);
++                if(!body||!visible(body))return;
++                const rr=Array.from(body.querySelectorAll('[role="row"]')).filter(visible);
++                if(!rr.length)return;
++                let cols=header?Array.from(header.querySelectorAll('[role="columnheader"]')).filter(visible):[];
++                if(!cols.length)cols=Array.from(rr[0].querySelectorAll('[role="gridcell"]')).filter(visible);
++                cols.sort((a,b)=>a.getBoundingClientRect().left-b.getBoundingClientRect().left);
++                const keys=cols.map(c=>c.getAttribute("col-id"));
++                if(!keys.length||keys.some(k=>k===null)||new Set(keys).size!==keys.length)throw new Error("Grid columns are not ready");
++                const rows=[["AG row index"].concat(cols.map(c=>{const label=c.querySelector(".ag-header-cell-text");return label?text(label).trim():c.getAttribute("col-id");}))];
++                rr.sort((a,b)=>a.getBoundingClientRect().top-b.getBoundingClientRect().top).forEach(function(row){
++                    const cells=new Map(Array.from(row.querySelectorAll('[role="gridcell"]')).filter(visible).map(c=>[c.getAttribute("col-id"),text(c).trim()]));
++                    if(!keys.every(k=>cells.has(k)))throw new Error("Grid changed during capture; wait and retry");
++                    rows.push([row.getAttribute("row-index")||row.getAttribute("aria-rowindex")||"not recorded"].concat(keys.map(k=>cells.get(k))));
++                });
++                blocks.push({kind:"table",caption:(heading||"AG Grid")+" — "+p[0]+" pane, rendered rows/columns only",rows:rows});captured++;
++            });
++            if(!captured) {
++                if(n.querySelectorAll('[role="gridcell"]').length)throw new Error("Unsupported populated grid pane; no partial export made");
++                blocks.push({kind:"paragraph",text:"AG Grid has no rendered data rows; no underlying rows exported."});
++            }
++            blocks.push({kind:"paragraph",text:"AG Grid captures rendered rows/columns only. Pinned column panes are separate; unrendered and pinned-top/bottom rows are excluded."});
++        }
++        function walk(n) {
++            if(++visited>200000)throw new Error("View too large; reduce the selected content");
++            if(n.nodeType===3){const value=(n.nodeValue||"").trim();if(value)blocks.push({kind:"paragraph",text:value});return;}
++            if(n.nodeType!==1||!visible(n))return;
++            const tag=n.tagName;
++            if(["SCRIPT","STYLE","NOSCRIPT","SVG","CANVAS","BUTTON","INPUT","SELECT","OPTION","TEXTAREA"].includes(tag)||n.matches(".dash-dropdown, .Select-menu-outer"))return;
++            if(n.classList.contains("ag-root")){grid(n);return;}
++            if(n.classList.contains("js-plotly-plot")){
++                if(!Array.isArray(n.data)||!n.layout)throw new Error("Chart is not ready");
++                blocks.push({kind:"figure",figure:plain({data:n.data,layout:n.layout})});return;
++            }
++            if(tag==="TABLE"){
++                const rows=Array.from(n.rows).filter(visible).map(r=>Array.from(r.cells).filter(visible).map(c=>text(c).trim())).filter(r=>r.length);
++                if(rows.length)blocks.push({kind:"table",caption:heading,rows:rows});return;
++            }
++            if(/^H[1-6]$/.test(tag)){const value=text(n).trim();if(value){heading=value;blocks.push({kind:"heading",level:Number(tag.slice(1)),text:value});}return;}
++            if(["P","PRE","LI","LABEL","SMALL","SUMMARY"].includes(tag)){const value=text(n).trim();if(value)blocks.push({kind:tag==="PRE"?"pre":"paragraph",text:value});return;}
++            Array.from(n.childNodes).forEach(walk);
++        }
++        walk(root);
++        if(!blocks.length)throw new Error("No rendered report content");
++        const controls=[];
++        root.querySelectorAll(".dash-dropdown").forEach(function(c){if(!visible(c))return;const selected=Array.from(c.querySelectorAll('.Select-value-label,[class*="-singleValue"],[class*="-multiValue__label"]')).filter(visible).map(x=>text(x).trim());controls.push({id:c.id||"dropdown",kind:"dropdown_display_labels",value:selected.join(" | ")||"No displayed selection"});});
++        root.querySelectorAll('input[type="radio"]:checked,input[type="checkbox"]:checked').forEach(function(c){const label=c.closest("label")||c.parentElement;if(!label||!visible(label))return;const owner=c.closest("[id]");controls.push({id:owner?owner.id:"selection",kind:c.type,value:text(label).trim()||String(c.value)});});
++        root.querySelectorAll('input[type="text"],input[type="number"],input[type="date"],textarea').forEach(function(c){if(visible(c)&&!c.closest(".dash-dropdown"))controls.push({id:c.id||"input",kind:c.type||"textarea",value:String(c.value)});});
++        const result={schema_version:1,format:format,active_tab:tab,captured_at:new Date().toISOString(),include_final_evaluation:allowed,controls:controls,blocks:blocks,request_id:Date.now()+"-"+Math.random().toString(16).slice(2)};
++        if(new TextEncoder().encode(JSON.stringify(result)).length>12*1024*1024)throw new Error("Snapshot exceeds 12 MiB; reduce view");
++        return result;
++    } catch(e) {return {error:String(e.message||e),active_tab:tab,format:format,request_id:Date.now()+"-"+Math.random()};}
++}
++'''
+diff --git a/src/ml_template/dashboard/report_callbacks.py b/src/ml_template/dashboard/report_callbacks.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/dashboard/report_callbacks.py
+@@ -0,0 +1,60 @@
++"""Click-only snapshot downloads; no registry, source data or model APIs."""
++from datetime import UTC, datetime
++from uuid import uuid4
++
++from dash import Input, Output, State, dcc, html, no_update
++from dash.exceptions import PreventUpdate
++
++from ml_template.dashboard.report_client import CLIENTSIDE_CAPTURE
++from ml_template.dashboard.report_export import build_bundle, build_html
++
++
++def export_toolbar():
++    return html.Div([
++        html.Button("Save current tab — HTML", id="report-export-html", n_clicks=0),
++        html.Button("Save current tab — ZIP bundle", id="report-export-zip", n_clicks=0,
++                    style={"marginLeft": "8px"}),
++        dcc.Checklist(id="report-export-consent", value=[], options=[{
++            "label": "Allow exporting visible Final evaluation content", "value": "allow_final_evaluation"}]),
++        html.Small("Rendered tab only. Tables keep displayed precision/limits; figures include chart data. No source files/models are loaded."),
++        html.Div(id="report-export-status", role="status", **{"aria-live": "polite"}),
++        dcc.Store(id="report-export-snapshot", storage_type="memory"),
++        dcc.Download(id="report-export-download"),
++    ], style={"padding": "12px", "borderBottom": "1px solid #ddd"})
++
++
++def download_snapshot(snapshot, current_tab, consent):
++    if not snapshot:
++        raise PreventUpdate
++    try:
++        if not isinstance(snapshot, dict):
++            raise ValueError("Invalid browser snapshot")
++        if snapshot.get("error"):
++            raise ValueError(str(snapshot["error"])[:1500])
++        if snapshot.get("active_tab") != current_tab:
++            raise ValueError("Active tab changed; click export again")
++        if current_tab == "evaluation" and not (isinstance(consent, list) and "allow_final_evaluation" in consent):
++            raise ValueError("Explicitly allow visible Final evaluation content first")
++        name = "dashboard-" + str(current_tab) + "-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8]
++        if snapshot.get("format") == "html":
++            result = dcc.send_string(build_html(snapshot), name + ".html", type="text/html;charset=utf-8")
++        elif snapshot.get("format") == "zip":
++            result = dcc.send_bytes(build_bundle(snapshot), name + ".zip", type="application/zip")
++        else:
++            raise ValueError("Unknown report format")
++        return result, "Download prepared: rendered snapshot, not full source artifacts."
++    except (ValueError, TypeError, KeyError, OverflowError, RecursionError) as exc:
++        return no_update, "Export unavailable: " + str(exc)[:1500]
++
++
++def register_exports(app):
++    app.clientside_callback(
++        CLIENTSIDE_CAPTURE, Output("report-export-snapshot", "data"),
++        Input("report-export-html", "n_clicks"), Input("report-export-zip", "n_clicks"),
++        State("dashboard-tab", "value"), State("report-export-consent", "value"), prevent_initial_call=True,
++    )
++    app.callback(
++        Output("report-export-download", "data"), Output("report-export-status", "children"),
++        Input("report-export-snapshot", "data"), State("dashboard-tab", "value"),
++        State("report-export-consent", "value"), prevent_initial_call=True,
++    )(download_snapshot)
+diff --git a/src/ml_template/dashboard/app.py b/src/ml_template/dashboard/app.py
+--- a/src/ml_template/dashboard/app.py
++++ b/src/ml_template/dashboard/app.py
+@@ -15,6 +15,7 @@
+     run_page,
+     sweeps_page,
+ )
++from ml_template.dashboard.report_callbacks import export_toolbar, register_exports
+ 
+ 
+ def create_app(engine=None):
+@@ -36,6 +37,7 @@
+     def layout():
+         return html.Div(
+             [
++                export_toolbar(),
+                 dcc.Tabs(
+                     id="dashboard-tab",
+                     value="run",
+@@ -58,6 +60,7 @@
+     app.layout = layout
+     for _value, _label, _container, page in pages:
+         page.register_callbacks(app, engine)
++    register_exports(app)
+ 
+     @app.callback(
+         *[Output(container, "style") for _value, _label, container, _page in pages],
+diff --git a/tests/dashboard/test_report_export.py b/tests/dashboard/test_report_export.py
+new file mode 100644
+--- /dev/null
++++ b/tests/dashboard/test_report_export.py
+@@ -0,0 +1,128 @@
++"""Actual renderer tests, independent of models, registry and source datasets."""
++import copy
++import csv
++import hashlib
++import io
++import json
++import zipfile
++
++import pytest
++
++from ml_template.dashboard import report_export as report
++
++
++def snapshot():
++    return {"schema_version": 1, "format": "html", "active_tab": "experiments",
++            "captured_at": "2026-11-11T14:39:00Z", "include_final_evaluation": False,
++            "controls": [{"id": "cohort", "kind": "dropdown_display_labels", "value": "concrete | MPa"}],
++            "blocks": [{"kind": "heading", "level": 3, "text": "Recorded model parameters"},
++                       {"kind": "table", "caption": "NN parameters", "rows": [["hidden_dims"], ["[64, 32]"]]},
++                       {"kind": "paragraph", "text": "Showing 1 of 200 rows; development evidence only"}]}
++
++
++def test_html_preserves_displayed_content():
++    result = report.build_html(snapshot())
++    assert "[64, 32]" in result and "concrete | MPa" in result
++    assert "Showing 1 of 200 rows" in result and "displayed precision" in result
++    assert "<script>" not in result and "connect-src" in result
++
++
++def test_text_is_escaped():
++    value = snapshot()
++    value["blocks"][0]["text"] = "<script>window.injected=1</script>"
++    result = report.build_html(value)
++    assert "<script>window.injected" not in result
++    assert "&lt;script&gt;" in result
++
++
++def test_zip_checksums_and_snapshot():
++    value = snapshot()
++    with zipfile.ZipFile(io.BytesIO(report.build_bundle(value))) as archive:
++        assert archive.testzip() is None
++        assert json.loads(archive.read("snapshot.json")) == value
++        info = json.loads(archive.read("metadata.json"))
++        assert info["underlying_data_reloaded"] is False and info["artifact_integrity_reverified"] is False
++        for name, digest in json.loads(archive.read("SHA256SUMS.json")).items():
++            assert hashlib.sha256(archive.read(name)).hexdigest() == digest
++        assert "tables/table_001.csv" in archive.namelist()
++
++
++@pytest.mark.parametrize("value", ["=cmd", "+1", "-2.5", "@name", "  =cmd", "\ttext", "\rtext", "\ntext"])
++def test_spreadsheet_formula_escaping(value):
++    snap = snapshot()
++    snap["blocks"][1]["rows"] = [[value]]
++    with zipfile.ZipFile(io.BytesIO(report.build_bundle(snap))) as archive:
++        rows = list(csv.reader(io.StringIO(archive.read("tables/table_001.csv").decode("utf-8-sig"))))
++        assert rows == [["'" + value]]
++        assert json.loads(archive.read("snapshot.json"))["blocks"][1]["rows"] == [[value]]
++
++
++@pytest.mark.parametrize("tab", list(report.TABS))
++def test_tab_labels(tab):
++    snap = snapshot()
++    snap["active_tab"] = tab
++    snap["include_final_evaluation"] = tab == "evaluation"
++    assert report.TABS[tab] in report.build_html(snap)
++
++
++@pytest.mark.parametrize("override", [
++    {"schema_version": True}, {"schema_version": 2}, {"active_tab": "../bad"},
++    {"captured_at": "2026-11-11"}, {"captured_at": "bad"}, {"include_final_evaluation": "yes"},
++    {"blocks": []}, {"controls": "bad"}, {"active_tab": "evaluation"},
++    {"blocks": [{"kind": "html", "text": "bad"}]},
++    {"blocks": [{"kind": "heading", "level": 9, "text": "bad"}]},
++    {"blocks": [{"kind": "table", "rows": [[None]]}]},
++])
++def test_invalid_snapshots_rejected(override):
++    snap = snapshot()
++    snap.update(override)
++    with pytest.raises((ValueError, TypeError)):
++        report.build_html(snap)
++
++
++def test_size_limits(monkeypatch):
++    monkeypatch.setattr(report, "MAX_BYTES", 20)
++    with pytest.raises(ValueError):
++        report.build_html(snapshot())
++
++
++def test_cell_limits(monkeypatch):
++    monkeypatch.setattr(report, "MAX_CELLS", 1)
++    with pytest.raises(ValueError):
++        report.build_bundle(snapshot())
++
++
++def test_plotly_embedded_once_and_chart_json_escaped():
++    pytest.importorskip("plotly")
++    snap = snapshot()
++    attack = "</script><script>window.reportInjected=true</script>"
++    fig = {"data": [{"type": "scatter", "x": [1, 2], "y": [3, 4], "text": [attack, "safe"]}], "layout": {}}
++    snap["blocks"] += [{"kind": "figure", "figure": fig}, {"kind": "figure", "figure": copy.deepcopy(fig)}]
++    html = report.build_html(snap)
++    assert attack not in html and "\\u003c/script\\u003e" in html
++    assert html.count("plotly.js v") == 1 and '<script src=' not in html
++    with zipfile.ZipFile(io.BytesIO(report.build_bundle(snap))) as archive:
++        assert "figures/figure_002.json" in archive.namelist()
++
++
++@pytest.mark.parametrize("fig", [
++    {"data": [{"type": "scattergeo"}], "layout": {}},
++    {"data": [{"type": "image", "source": "https://example.invalid/image.png"}], "layout": {}},
++    {"data": [], "layout": {"images": [{"source": "file:///secret"}]}},
++    {"data": [{"x": [float("nan")]}], "layout": {}},
++])
++def test_external_or_nonfinite_figures_rejected(fig):
++    snap = snapshot()
++    snap["blocks"].append({"kind": "figure", "figure": fig})
++    with pytest.raises(ValueError):
++        report.build_html(snap)
++
++
++def test_safe_bundle_paths_and_no_side_effects(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    snap = snapshot()
++    snap["blocks"][1]["caption"] = "../../model.ubj"
++    original = copy.deepcopy(snap)
++    with zipfile.ZipFile(io.BytesIO(report.build_bundle(snap))) as archive:
++        assert not any(".." in name for name in archive.namelist())
++    assert snap == original and not list(tmp_path.iterdir())
+diff --git a/tests/dashboard/test_report_export_dash.py b/tests/dashboard/test_report_export_dash.py
+new file mode 100644
+--- /dev/null
++++ b/tests/dashboard/test_report_export_dash.py
+@@ -0,0 +1,59 @@
++"""Real Dash helper/registration tests; must execute in the user's environment."""
++import base64
++import io
++import zipfile
++
++import pytest
++
++
++def snap():
++    return {"schema_version": 1, "format": "html", "active_tab": "experiments",
++            "captured_at": "2026-11-11T14:39:00Z", "include_final_evaluation": False,
++            "controls": [], "blocks": [{"kind": "paragraph", "text": "Synthetic evidence"}]}
++
++
++def test_real_dash_registration():
++    pytest.importorskip("dash")
++    from dash import Dash, dcc, html
++    from ml_template.dashboard.report_callbacks import export_toolbar, register_exports
++    app = Dash(__name__)
++    app.layout = html.Div([export_toolbar(), dcc.Tabs(id="dashboard-tab", value="experiments")])
++    register_exports(app)
++    assert len(app.callback_map) == 2
++    assert len(app._inline_scripts) == 1
++
++
++@pytest.mark.parametrize("format", ["html", "zip"])
++def test_real_download_helpers(format):
++    pytest.importorskip("dash")
++    from ml_template.dashboard.report_callbacks import download_snapshot
++    value = snap()
++    value["format"] = format
++    data, status = download_snapshot(value, "experiments", [])
++    assert data["filename"].endswith("." + format) and "prepared" in status
++    if format == "html":
++        assert "Synthetic evidence" in data["content"]
++    else:
++        with zipfile.ZipFile(io.BytesIO(base64.b64decode(data["content"]))) as archive:
++            assert archive.testzip() is None
++
++
++def test_tab_and_consent_guards():
++    pytest.importorskip("dash")
++    from dash import no_update
++    from ml_template.dashboard.report_callbacks import download_snapshot
++    value = snap()
++    result, _ = download_snapshot(value, "run", [])
++    assert result is no_update
++    value["active_tab"] = "evaluation"
++    value["include_final_evaluation"] = True
++    result, _ = download_snapshot(value, "evaluation", [])
++    assert result is no_update
++
++
++def test_malformed_snapshot():
++    pytest.importorskip("dash")
++    from dash import no_update
++    from ml_template.dashboard.report_callbacks import download_snapshot
++    result, message = download_snapshot([1], "experiments", [])
++    assert result is no_update and "unavailable" in message
+diff --git a/tests/dashboard/test_report_export_client.py b/tests/dashboard/test_report_export_client.py
+new file mode 100644
+--- /dev/null
++++ b/tests/dashboard/test_report_export_client.py
+@@ -0,0 +1,36 @@
++"""Node DOM-fixture checks; these are not browser acceptance."""
++import json
++import shutil
++import subprocess
++
++import pytest
++
++from ml_template.dashboard.report_client import CLIENTSIDE_CAPTURE
++
++NODE_FIXTURE = r'''
++
++const assert=require('assert');const capture=__CLIENT__;
++const T=x=>({nodeType:3,nodeValue:x});
++function E(tag,children=[],opts={}){return {nodeType:1,tagName:tag,childNodes:children,data:opts.data,layout:opts.layout,rows:opts.rows||[],cells:opts.cells||[],hidden:!!opts.hidden,classList:{contains:x=>(opts.classes||[]).includes(x)},getClientRects(){return this.hidden?[]:[{}];},matches(s){return s.includes('data-dash-is-loading')&&!!opts.loading;},querySelector(s){return s.includes('data-dash-is-loading')&&opts.loading?this:null;},querySelectorAll(){return [];}};}
++let root;global.window={getComputedStyle:n=>({display:n.hidden?'none':'block',visibility:'visible',opacity:'1'}),dash_clientside:{callback_context:{triggered_id:'report-export-html'},no_update:{}}};global.document={getElementById:()=>root};
++let n=0;function check(f){f();n++;}
++check(()=>{root=E('DIV',[E('P',[T('Visible')]),E('DIV',[E('P',[T('SECRET')])],{hidden:true})]);const s=capture(1,0,'experiments',[]);assert(!s.error);assert(!JSON.stringify(s).includes('SECRET'));});
++check(()=>{root=E('DIV',[E('DIV',[],{classes:['js-plotly-plot'],data:[{x:new Float64Array([1,2]),y:[3,4]}],layout:{}})]);const s=capture(1,0,'compare',[]);assert.deepEqual(s.blocks[0].figure.data[0].x,[1,2]);});
++check(()=>{root=E('DIV',[E('P',[T('Frozen')])]);assert(capture(1,0,'evaluation',[]).error);assert(!capture(1,0,'evaluation',['allow_final_evaluation']).error);});
++check(()=>{root=E('DIV',[],{loading:true});assert(capture(1,0,'run',[]).error.includes('loading'));});
++check(()=>{const c=E('TD',[T('[64, 32]')]);const row=E('TR',[c],{cells:[c]});root=E('DIV',[E('TABLE',[row],{rows:[row]})]);assert.equal(capture(1,0,'experiments',[]).blocks[0].rows[0][0],'[64, 32]');});
++check(()=>{root=E('DIV',[E('P',[T('Ready')])]);window.dash_clientside.callback_context.triggered_id='report-export-zip';assert.equal(capture(1,1,'run',[]).format,'zip');});
++console.log(JSON.stringify({checks_passed:n,browser_acceptance:false}));
++
++'''
++
++
++def test_capture_on_dom_fixture(tmp_path):
++    node = shutil.which("node")
++    if not node:
++        pytest.skip("Node not installed; perform browser acceptance")
++    path = tmp_path / "capture.js"
++    path.write_text(NODE_FIXTURE.replace("__CLIENT__", CLIENTSIDE_CAPTURE), encoding="utf-8")
++    result = subprocess.run([node, str(path)], capture_output=True, text=True, timeout=20, check=False)
++    assert result.returncode == 0, result.stderr
++    assert json.loads(result.stdout)["checks_passed"] == 6

@@ -1,0 +1,11 @@
+# Freeze an approved batch as reference. Monitoring current data against itself is only a plumbing check.
+schema_version: 1
+scoring_batch_id: score_20261111_115423_cc302c961409
+name: "concrete_synthetic_smoke_reference"
+approved_population: >-
+  Three synthetic concrete mixtures created for pipeline smoke testing.
+  Selected only to exercise reference creation and drift-report generation.
+  Not representative of operational concrete production and not approved
+  for production monitoring conclusions.
+numeric_bins: 10
+target_unit: MPa

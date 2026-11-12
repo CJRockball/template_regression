@@ -32,7 +32,9 @@ def table(frame, max_rows=1000):
     shown = frame.head(max_rows)
 
     def scalar(value):
-        if value is None or pd.isna(value):
+        if value is None:
+            return "—"
+        if pd.api.types.is_scalar(value) and pd.isna(value):
             return "—"
         return f"{value:.6g}" if isinstance(value, float) else str(value)
 

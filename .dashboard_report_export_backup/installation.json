@@ -1,0 +1,30 @@
+{
+  "src/ml_template/dashboard/report_export.py": {
+    "before": null,
+    "after": "c2e3603d7c4f9e46eea134104312665a92b8d81afa7b0acbf26d37b32ad1a4e3"
+  },
+  "src/ml_template/dashboard/report_client.py": {
+    "before": null,
+    "after": "ea5e9b28bc78710301730cea7ed8e83c0e1c780b361989670a0217d5a4b4959b"
+  },
+  "src/ml_template/dashboard/report_callbacks.py": {
+    "before": null,
+    "after": "cb4c3ece03815fc1262db755a8f23e8c0a78445c06ba225954b75d2a97a0af36"
+  },
+  "src/ml_template/dashboard/app.py": {
+    "before": "33562ed79b86db2f665b9a68ff5a6d3e20b1c20a6f0a9b97dd95967971b67c85",
+    "after": "c3b0c15f1861847b65873df6d23251d72a3669816f8c9be2e1268213599fddb7"
+  },
+  "tests/dashboard/test_report_export.py": {
+    "before": null,
+    "after": "9692d695b15a13e51f2b5db9873c165840a3a3044bbc4c22b29158ed712b2b09"
+  },
+  "tests/dashboard/test_report_export_dash.py": {
+    "before": null,
+    "after": "1f32ea2cdc30736b2f997fa3aed2750370dc1509089771be094e0f9e3ca27038"
+  },
+  "tests/dashboard/test_report_export_client.py": {
+    "before": null,
+    "after": "cc2140051f468550456e7ad4c349aba29159736220d05ca9d916aaf823812897"
+  }
+}

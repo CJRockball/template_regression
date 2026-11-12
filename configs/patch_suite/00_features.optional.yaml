@@ -1,0 +1,7 @@
+# Optional stateless plumbing profile, not a domain feature recommendation. Freeze feature selection before training/calibration.
+generic_interactions:
+  numeric_pairs:
+  - a: REPLACE_NUMERIC_COLUMN_1
+    b: REPLACE_NUMERIC_COLUMN_2
+    ops:
+    - product
