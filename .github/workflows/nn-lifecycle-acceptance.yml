@@ -40,8 +40,8 @@ jobs:
       - name: Add explicit CPU Torch overlay in fresh CI environment only
         run: >-
           uv pip install --python .venv/bin/python --no-config
-          --index-url https://download.pytorch.org/whl/cpu
-          --extra-index-url https://pypi.org/simple
+          --default-index https://pypi.org/simple
+          --index https://download.pytorch.org/whl/cpu
           'torch==2.9.1+cpu'
       - name: Verify CPU overlay and required native/UI imports
         run: |
