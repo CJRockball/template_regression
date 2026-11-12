@@ -48,7 +48,10 @@ def test_separate_dashboard_can_construct(tmp_path, monkeypatch):
     app = module.create_app(tmp_path / "unused.db")
     assert app.server.test_client().get("/").status_code == 200
     assert app.server.test_client().get("/_dash-layout").status_code == 200
-    assert len(app.callback_map) == 4
+    assert len(app.callback_map) == 5
+    export = app.callback_map["mon-report-download.data"]
+    assert export["inputs"] == [{"id": "mon-report-export", "property": "n_clicks"}]
+    assert export["state"] == [{"id": "mon-selection", "property": "value"}]
     assert "Released model explanations" in str(app.layout())
 
 

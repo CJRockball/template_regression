@@ -65,17 +65,15 @@ def validate_output(config, root):
     if pipeline is not None and root.is_relative_to(Path(pipeline).resolve()):
         raise ValueError("Monitoring output cannot be inside immutable pipeline artifacts")
     if any(
-
-            (parent / name).is_file()
-            for parent in [root, *root.parents]
-            for name in [
-                "manifest.json",
-                "artifact_manifest.json",
-                "artifacts.json",
-                "pipeline_manifest.json",
-                "release.json",
-            ]
-
+        (parent / name).is_file()
+        for parent in [root, *root.parents]
+        for name in [
+            "manifest.json",
+            "artifact_manifest.json",
+            "artifacts.json",
+            "pipeline_manifest.json",
+            "release.json",
+        ]
     ):
         raise ValueError("Monitoring output cannot be inside sealed artifacts")
     return root

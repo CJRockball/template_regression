@@ -215,11 +215,8 @@ def test_native_nn_monitoring(trained, tmp_path, monkeypatch, kind, corrected):
         == "not_assessed_insufficient_outcomes"
     )
     assert not any(
-
-            f["rule"]
-            in {"rmse_warning", "mae_warning", "abs_bias_warning", "interval_undercoverage"}
-            for f in partial_view["findings"]
-
+        f["rule"] in {"rmse_warning", "mae_warning", "abs_bias_warning", "interval_undercoverage"}
+        for f in partial_view["findings"]
     )
     second = run_pipeline(batch_request, check_only=False)
     second_common = {
