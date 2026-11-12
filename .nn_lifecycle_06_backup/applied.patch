@@ -1,0 +1,941 @@
+diff --git a/src/ml_template/monitoring/monitor_inputs.py b/src/ml_template/monitoring/monitor_inputs.py
+--- a/src/ml_template/monitoring/monitor_inputs.py
++++ b/src/ml_template/monitoring/monitor_inputs.py
+@@ -114,6 +114,11 @@
+         from ml_template.monitoring.regression import validate_predictions
+ 
+         validate_predictions(predictions, summary, info)
++        if info.get("model_type") == "nn":
++            from ml_template.monitoring.nn_monitoring_contract import release_binding
++
++            summary = release_binding(summary, info, manifest, record, release_dir, entries,
++                                      digest(directory / "artifacts.json"))
+         predictions = predictions.set_index(key).loc[source[key]].reset_index()
+         hashes = {name: item["sha256"] for name, item in entries.items()}
+         hashes["artifacts.json"] = digest(directory / "artifacts.json")
+diff --git a/src/ml_template/monitoring/reference.py b/src/ml_template/monitoring/reference.py
+--- a/src/ml_template/monitoring/reference.py
++++ b/src/ml_template/monitoring/reference.py
+@@ -10,6 +10,9 @@
+ 
+ def build_reference(engine, config, *, output_root, check_only=False):
+     batch = load_batch(engine, config.scoring_batch_id)
++    from ml_template.monitoring.nn_monitoring_contract import context_for
++
++    nn_context = context_for(batch, config)
+     from ml_template.monitoring.nullable_drift import nullable_profile
+     from ml_template.monitoring.regression import validate_options
+ 
+@@ -53,6 +56,7 @@
+         "source_hashes": batch.artifact_hashes,
+         "flagged_fraction": batch.summary.get("flagged_fraction"),
+         "n_rows": len(batch.source),
++        **({"nn_context": nn_context} if nn_context is not None else {}),
+     }
+     write_json(directory / "config.json", config.model_dump(mode="json"))
+     write_json(directory / "reference.json", result)
+@@ -85,4 +89,7 @@
+         raise ValueError("reference task differs from batch")
+     if result["release_id"] != batch.release_id or result["contract"] != batch.contract:
+         raise ValueError("reference must use the same release and source contract")
++    from ml_template.monitoring.nn_monitoring_contract import validate_saved_context
++
++    validate_saved_context(result, batch)
+     return result
+diff --git a/src/ml_template/monitoring/label_inputs.py b/src/ml_template/monitoring/label_inputs.py
+--- a/src/ml_template/monitoring/label_inputs.py
++++ b/src/ml_template/monitoring/label_inputs.py
+@@ -64,6 +64,9 @@
+ 
+ def import_labels(engine, config, *, output_root, check_only=False):
+     batch = load_batch(engine, config.scoring_batch_id)
++    from ml_template.monitoring.nn_monitoring_contract import context_for
++
++    nn_context = context_for(batch, config)
+     from ml_template.monitoring.regression import validate_options
+ 
+     validate_options(batch, config)
+@@ -107,6 +110,7 @@
+         "release_id": batch.release_id,
+         "source_sha256": before,
+         "scoring_hashes": batch.artifact_hashes,
++        **({"nn_context": nn_context} if nn_context is not None else {}),
+     }
+     write_json(directory / "labels.json", metadata)
+     manifest_hash = seal(directory)
+@@ -144,5 +148,8 @@
+         or metadata["scoring_hashes"] != batch.artifact_hashes
+     ):
+         raise ValueError("label import prediction provenance mismatch")
++    from ml_template.monitoring.nn_monitoring_contract import validate_saved_context
++
++    validate_saved_context(metadata, batch, same_batch=True)
+     frame = validate_labels(pd.read_parquet(directory / "labels.parquet"), batch)
+     return {"metadata": metadata, "frame": frame}
+diff --git a/src/ml_template/monitoring/monitor_batch.py b/src/ml_template/monitoring/monitor_batch.py
+--- a/src/ml_template/monitoring/monitor_batch.py
++++ b/src/ml_template/monitoring/monitor_batch.py
+@@ -148,6 +148,11 @@
+ 
+ def prepare(engine, config):
+     batch = load_batch(engine, config.scoring_batch_id)
++    from ml_template.monitoring.nn_monitoring_contract import context_for
++
++    nn_context = context_for(batch, config)
++    if nn_context is not None:
++        batch.summary = {**batch.summary, "nn_context": nn_context}
+     reference = load_reference(engine, config.reference_id, batch)
+     labels = load_labels(engine, config.label_import_id, batch) if config.label_import_id else None
+     quality_report(batch, config.quality_ranges)
+@@ -273,6 +278,13 @@
+                     "Integrity hashes are not signatures",
+                 ],
+             )
++        if batch.summary.get("model_type") == "nn":
++            from ml_template.monitoring.nn_monitoring_contract import assessment_scope
++
++            summary.update(model_type="nn", nn_context=batch.summary["nn_context"],
++                assessment_scope=assessment_scope(config, performance, sampling,
++                                                  reference["n_rows"], len(batch.source),
++                                                  self_reference=reference["scoring_batch_id"] == batch.batch_id))
+         write_json(directory / "config.json", config.model_dump(mode="json"))
+         write_json(directory / "quality.json", quality)
+         write_json(directory / "drift.json", drift)
+diff --git a/src/ml_template/usage_dashboard/monitoring_data.py b/src/ml_template/usage_dashboard/monitoring_data.py
+--- a/src/ml_template/usage_dashboard/monitoring_data.py
++++ b/src/ml_template/usage_dashboard/monitoring_data.py
+@@ -77,13 +77,24 @@
+         if view["config"].get(name) != record[name]:
+             raise ValueError(f"monitoring configuration/registry mismatch: {name}")
+     if (
+-        view["summary"].get("schema_version") != 1
++        view["summary"].get("schema_version") not in {1, 2}
+         or not isinstance(view["drift"], list)
+         or not isinstance(view["findings"], list)
+     ):
+         raise ValueError("invalid monitoring result schema")
+     if view["performance"] is not None and not isinstance(view["performance"], dict):
+         raise ValueError("invalid labelled-performance result")
++    if view["summary"]["schema_version"] == 2:
++        summary = view["summary"]
++        if summary.get("task") != "regression" or summary.get("prediction_kind") != "continuous" or not summary.get("target_unit"):
++            raise ValueError("Invalid frozen regression monitoring semantics")
++        if view["performance"] is not None and view["performance"].get("task") != "regression":
++            raise ValueError("Wrong monitoring performance task")
++    elif view["summary"].get("task", "binary_classification") != "binary_classification":
++        raise ValueError("Wrong legacy monitoring task")
++    from ml_template.monitoring.nn_monitoring_contract import validate_frozen_view
++
++    validate_frozen_view(view)
+     return view
+ 
+ 
+@@ -120,6 +131,19 @@
+             seen.add(batch)
+             view = load_assessment(database, record["monitoring_id"])
+             perf = view["performance"] or {}
++            summary = view["summary"]
++            if summary.get("task", "binary_classification") != selected.get("task", "binary_classification"):
++                continue
++            if summary.get("task") == "regression":
++                if summary.get("target_unit") != selected.get("target_unit"):
++                    continue
++                metrics = perf.get("score_metrics", {}).get("y_pred_release", {})
++                rows.append({"monitoring_id": record["monitoring_id"], "scoring_batch_id": batch,
++                    "as_of": summary["as_of"], "task": "regression", "target_unit": summary["target_unit"],
++                    "rmse": metrics.get("rmse"), "mae": metrics.get("mae"), "bias": metrics.get("bias"),
++                    "r2": metrics.get("r2"), "coverage": perf.get("mature_label_coverage"),
++                    "n_evaluated": perf.get("n_evaluated"), "support": perf.get("sufficient_support")})
++                continue
+             metrics = perf.get("score_metrics", {}).get("p_release", {})
+             rows.append(
+                 {
+@@ -140,6 +164,10 @@
+ 
+ 
+ def metric_rows(perf):
++    if perf and perf.get("task") == "regression":
++        from ml_template.usage_dashboard.nn_monitor_report import metric_rows as regression_rows
++
++        return regression_rows(perf)
+     if not perf:
+         return []
+     return [
+diff --git a/src/ml_template/usage_dashboard/monitoring_figures.py b/src/ml_template/usage_dashboard/monitoring_figures.py
+--- a/src/ml_template/usage_dashboard/monitoring_figures.py
++++ b/src/ml_template/usage_dashboard/monitoring_figures.py
+@@ -22,6 +22,8 @@
+ 
+ 
+ def reliability_figure(perf):
++    if perf and perf.get("task") == "regression":
++        return empty("Probability reliability is not applicable to regression; see saved interval coverage metrics")
+     if not perf or not perf.get("n_evaluated"):
+         return empty("No mature labelled rows selected")
+     fig = go.Figure(
+@@ -49,6 +51,10 @@
+ 
+ 
+ def history_figure(rows):
++    if rows and rows[0].get("task") == "regression":
++        from ml_template.usage_dashboard.nn_monitor_report import regression_history
++
++        return regression_history(rows)
+     if not rows:
+         return empty("No comparable assessment history")
+     fig = go.Figure()
+diff --git a/src/ml_template/usage_dashboard/monitoring_page.py b/src/ml_template/usage_dashboard/monitoring_page.py
+--- a/src/ml_template/usage_dashboard/monitoring_page.py
++++ b/src/ml_template/usage_dashboard/monitoring_page.py
+@@ -56,6 +56,11 @@
+             notes.append(
+                 "Outcome metrics describe the mature labelled subset, not automatically the full population."
+             )
++        if summary.get("task") == "regression":
++            notes.append("Regression bias = prediction minus truth; residual = truth minus prediction. No probability calibration curve applies.")
++        if summary.get("model_type") == "nn":
++            notes.append("NN assessment scope: " + json.dumps(summary["assessment_scope"], sort_keys=True))
++            notes.append("Verified Package 05 pipeline: " + summary["nn_context"]["pipeline_id"])
+         if errors:
+             notes.append("History verification failures: " + " | ".join(errors))
+         details = {
+@@ -80,7 +85,8 @@
+         return (
+             json.dumps(summary, indent=2),
+             findings,
+-            metric_rows(perf),
++            [{**row, "target_unit": "dimensionless" if row.get("metric") in {"r2", "nominal_coverage", "empirical_coverage"} else summary.get("target_unit")}
++             for row in metric_rows(perf)],
+             policy_rows(perf),
+             view["quality"].get("features", []),
+             drift_figure(view["drift"]),
+@@ -193,6 +199,8 @@
+                 value=options[0]["value"] if options else None,
+                 clearable=False,
+             ),
++            html.Button("Export selected saved monitoring report — ZIP", id="mon-report-export", n_clicks=0),
++            dcc.Download(id="mon-report-download"),
+             html.Pre(id="mon-summary"),
+             html.Pre(id="mon-notes", style={"whiteSpace": "pre-wrap"}),
+             html.H2("Findings"),
+@@ -213,6 +221,8 @@
+                     "n_positive",
+                     "n_negative",
+                     "sufficient_support",
++                    "target_unit",
++                    "level",
+                 ],
+             ),
+             dcc.Graph(id="mon-reliability"),
+@@ -248,3 +258,15 @@
+     )
+     def select_assessment(identity):
+         return monitoring_payload(database, identity)
++
++    from dash import State, dcc, no_update
++
++    @app.callback(Output("mon-report-download", "data"), Input("mon-report-export", "n_clicks"),
++                  State("mon-selection", "value"), prevent_initial_call=True)
++    def export_selected(clicks, identity):
++        if not clicks or not identity:
++            return no_update
++        from ml_template.usage_dashboard.nn_monitor_report import bundle_bytes
++
++        payload = bundle_bytes(load_assessment(database, identity), identity)
++        return dcc.send_bytes(lambda stream: stream.write(payload), identity + ".zip")
+diff --git a/src/ml_template/monitoring/nn_monitoring_contract.py b/src/ml_template/monitoring/nn_monitoring_contract.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/monitoring/nn_monitoring_contract.py
+@@ -0,0 +1,107 @@
++"""NN monitoring lineage and assessment contracts. No inference/runtime invocation."""
++from pathlib import Path
++from ml_template.monitoring.artifacts import digest, read_json, safe_path
++
++def release_binding(summary, info, manifest, record, release_dir, entries, scoring_manifest_sha256):
++    if info.get('model_type') != 'nn':
++        return summary
++    unit = info.get('target_unit')
++    if info.get('task') != 'regression' or info.get('prediction_kind') != 'continuous' or (not isinstance(unit, str)) or (not unit.strip()) or (unit.strip() in {'target units', 'target_units'}) or (summary.get('target_unit') not in {None, unit}) or (summary.get('parent_run_id') != info['parent_run_id']) or (summary.get('calibration_id') != info['calibration_id']) or (summary.get('release_variant') != info['release_variant']) or (summary.get('prediction_columns') != info['prediction_columns']):
++        raise ValueError('NN scoring/release unit or predictor binding differs')
++    descriptor = read_json(Path(release_dir) / 'predictor.json')
++    if descriptor.get('schema_version') != 3 or descriptor.get('model_type') != 'nn' or descriptor.get('kind') != info['predictor_kind']:
++        raise ValueError('NN monitoring requires the frozen NN descriptor')
++    frozen = {'release_id': record['release_id'], 'content_sha256': manifest['content_sha256'], 'parent_run_id': info['parent_run_id'], 'evaluation_id': info['evaluation_id'], 'calibration_id': info['calibration_id'], 'release_variant': info['release_variant'], 'predictor_kind': info['predictor_kind'], 'target_unit': unit, 'prediction_columns': info['prediction_columns'], 'interval_columns': info.get('interval_columns', {}), 'release_json_sha256': digest(Path(release_dir) / 'release.json'), 'predictor_json_sha256': digest(Path(release_dir) / 'predictor.json'), 'runtime_json_sha256': digest(Path(release_dir) / 'runtime.json')}
++    scored = {'scoring_batch_id': record['scoring_batch_id'], 'input_sha256': record['input_sha256'], 'n_rows': record['n_rows'], 'predictions_sha256': entries['predictions.parquet']['sha256'], 'artifacts_sha256': scoring_manifest_sha256}
++    return {**summary, 'model_type': 'nn', 'target_unit': unit, 'nn_binding': {'schema_version': 1, 'release': frozen, 'score': scored}, 'unit_provenance': 'verified_sealed_release; original score summary was not modified'}
++
++def verify_pipeline(root, identity, expected_manifest, batch):
++    root = Path(root).expanduser().resolve()
++    manifest_path = safe_path(root, 'pipeline_manifest.json')
++    if digest(manifest_path) != expected_manifest:
++        raise ValueError('Pipeline manifest differs from explicit expected SHA256')
++    manifest = read_json(manifest_path)
++    if manifest.get('schema_version') != 1 or not isinstance(manifest.get('files'), dict) or 'pipeline.json' not in manifest['files']:
++        raise ValueError('Incomplete Package 05 envelope')
++    actual = {}
++    for p in sorted(root.rglob('*')):
++        if p.is_symlink():
++            raise ValueError('Pipeline symlinks forbidden')
++        if p.is_file() and p.name != 'pipeline_manifest.json':
++            actual[p.relative_to(root).as_posix()] = {'sha256': digest(p), 'bytes': p.stat().st_size}
++    if actual != manifest['files']:
++        raise ValueError('Pipeline file hash/size/inventory differs')
++    for name in manifest['files']:
++        safe_path(root, name)
++    state = read_json(safe_path(root, 'pipeline.json'))
++    binding = batch.summary['nn_binding']
++    frozen = binding['release']
++    score = binding['score']
++    if root.name != identity or state.get('pipeline_id') != identity or state.get('status') != 'succeeded' or (state.get('stage') != 'complete') or (state.get('predictions_computed') is not True) or (state.get('labels_loaded') is not False) or (state.get('evaluation_executed') is not False) or (state.get('release_built') is not False) or (state.get('task') != 'regression') or (state.get('model_type') != 'nn') or (state.get('release_id') != frozen['release_id']) or (state.get('release_content_sha256') != frozen['content_sha256']) or (state.get('target_unit') != frozen['target_unit']) or (state.get('parent_run_id') != frozen['parent_run_id']) or (state.get('evaluation_id') != frozen['evaluation_id']) or (state.get('calibration_id') != frozen['calibration_id']) or (state.get('release_variant') != frozen['release_variant']) or (state.get('interval_columns') != frozen['interval_columns']) or (state.get('scoring_batch_id') != score['scoring_batch_id']) or (state.get('predictions_sha256') != score['predictions_sha256']) or (state.get('scoring_manifest_sha256') != score['artifacts_sha256']) or (state.get('n_rows') != score['n_rows']):
++        raise ValueError('Pipeline/release/scoring identity differs')
++    score_dir = Path(state['scoring_dir']).resolve()
++    if not score_dir.is_relative_to(root) or score_dir != Path(batch.record['artifact_dir']).resolve():
++        raise ValueError('Pipeline score directory differs from registry')
++    if digest(safe_path(score_dir, 'artifacts.json')) != score['artifacts_sha256']:
++        raise ValueError('Pipeline scoring manifest differs')
++    if state['input_format'] == 'canonical':
++        if state['input_sha256'] != score['input_sha256']:
++            raise ValueError('Canonical pipeline input binding differs')
++    elif state['input_format'] == 'raw':
++        prep = read_json(safe_path(root, 'prepared/manifest.json'))
++        if prep['input_sha256'] != state['input_sha256'] or prep['release_id'] != frozen['release_id'] or prep['canonical_sha256'] != score['input_sha256'] or (digest(safe_path(root, 'prepared/data.parquet')) != prep['canonical_sha256']):
++            raise ValueError('Raw-to-canonical pipeline binding differs')
++        names = [n for n in manifest['files'] if n in {'prepared/raw_input.csv', 'prepared/raw_input.parquet'}]
++        if len(names) != 1 or digest(safe_path(root, names[0])) != prep['input_sha256']:
++            raise ValueError('Raw snapshot binding differs')
++    else:
++        raise ValueError('Unknown pipeline input format')
++    return {'schema_version': 1, 'pipeline_id': identity, 'pipeline_dir': str(root), 'pipeline_manifest_sha256': expected_manifest, 'nn_binding': binding, 'model_loaded': False, 'predictions_recomputed': False}
++
++def context_for(batch, config):
++    if batch.summary.get('model_type') != 'nn':
++        if getattr(config, 'pipeline_dir', None) is not None:
++            raise ValueError('NN context cannot bind a non-NN batch')
++        return None
++    required = ['pipeline_dir', 'expected_pipeline_id', 'expected_pipeline_manifest_sha256']
++    if any((getattr(config, name, None) is None for name in required)):
++        raise ValueError('NN monitoring requires explicit Package 05 pipeline context; use nn_monitor')
++    if getattr(config, 'target_unit', None) != batch.summary['target_unit']:
++        raise ValueError('Monitoring units differ from frozen NN release')
++    return verify_pipeline(config.pipeline_dir, config.expected_pipeline_id, config.expected_pipeline_manifest_sha256, batch)
++
++def validate_saved_context(value, batch, *, same_batch=False):
++    if batch.summary.get('model_type') != 'nn':
++        return
++    ctx = value.get('nn_context')
++    if not isinstance(ctx, dict) or ctx.get('schema_version') != 1 or ctx['nn_binding']['release'] != batch.summary['nn_binding']['release']:
++        raise ValueError('Frozen NN reference/labels release context differs')
++    if same_batch and ctx['nn_binding']['score'] != batch.summary['nn_binding']['score']:
++        raise ValueError('Frozen NN labels scoring context differs')
++
++def assessment_scope(config, performance, sampling, reference_n, current_n, *, self_reference=False):
++    if performance is None:
++        status = 'unknown_no_labels'
++    elif performance['n_evaluated'] == 0:
++        status = 'not_assessed_no_mature_observed_outcomes'
++    elif not performance['sufficient_support']:
++        status = 'not_assessed_insufficient_outcomes'
++    elif performance['mature_label_coverage'] is None or performance['mature_label_coverage'] < config.min_label_coverage:
++        status = 'not_assessed_label_coverage'
++    elif sampling != 'all_rows':
++        status = 'not_assessed_selected_or_unknown_sampling'
++    else:
++        status = 'assessed_mature_labelled_subset'
++    return {'performance_status': status, 'distribution_status': 'not_assessed_insufficient_rows' if min(reference_n, current_n) < config.min_rows else 'not_assessed_self_reference' if self_reference else 'descriptive', 'self_reference': self_reference, 'reference_n': reference_n, 'current_n': current_n, 'min_rows': config.min_rows, 'min_labelled': config.min_labelled, 'prediction_source': 'saved_verified_scoring_artifacts', 'model_loaded': False, 'predictions_recomputed': False, 'bias_definition': 'mean(y_pred - y_true)', 'residual_definition': 'y_true - y_pred', 'automatic_promotion': False}
++
++def validate_frozen_view(view):
++    s, c = (view['summary'], view['config'])
++    ctx = s.get('nn_context')
++    if s.get('model_type') != 'nn':
++        return
++    if not isinstance(ctx, dict) or ctx.get('schema_version') != 1 or ctx['pipeline_id'] != c.get('expected_pipeline_id') or (ctx['pipeline_manifest_sha256'] != c.get('expected_pipeline_manifest_sha256')) or (ctx['nn_binding']['release']['release_id'] != s['release_id']) or (ctx['nn_binding']['release']['target_unit'] != s['target_unit']) or (ctx['nn_binding']['score']['scoring_batch_id'] != s['scoring_batch_id']) or (c['target_unit'] != s['target_unit']):
++        raise ValueError('Frozen NN monitoring context differs')
++    from types import SimpleNamespace
++    expected = assessment_scope(SimpleNamespace(**c), view['performance'], s['label_sampling'], s['assessment_scope']['reference_n'], s['n_rows'], self_reference=s['assessment_scope']['self_reference'])
++    if expected != s['assessment_scope']:
++        raise ValueError('Frozen NN assessment scope differs')
+diff --git a/src/ml_template/monitoring/nn_monitor.py b/src/ml_template/monitoring/nn_monitor.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/monitoring/nn_monitor.py
+@@ -0,0 +1,125 @@
++"""Explicit NN monitoring requests; delegates all analysis to the shared backend."""
++import argparse
++import json
++import sqlite3
++from pathlib import Path
++import pandas as pd
++import yaml
++from pydantic import BaseModel, ConfigDict, Field
++from ml_template.monitoring.monitor_config import ReferenceConfig, LabelConfig, MonitorConfig
++
++class NNContext(BaseModel):
++    model_config = ConfigDict(extra='forbid', allow_inf_nan=False)
++    pipeline_dir: Path
++    expected_pipeline_id: str = Field(pattern='^nnpipe_[A-Za-z0-9_]+$')
++    expected_pipeline_manifest_sha256: str = Field(pattern='^[0-9a-f]{64}$')
++
++class NNReferenceConfig(ReferenceConfig, NNContext):
++    target_unit: str = Field(min_length=1)
++
++class NNLabelConfig(LabelConfig, NNContext):
++    target_unit: str = Field(min_length=1)
++
++class NNMonitorConfig(MonitorConfig, NNContext):
++    target_unit: str = Field(min_length=1)
++
++class NNTemplateConfig(NNContext):
++    scoring_batch_id: str
++    target_unit: str = Field(min_length=1)
++
++class ReportConfig(BaseModel):
++    model_config = ConfigDict(extra='forbid')
++    monitoring_id: str
++
++def load_request(path, cls):
++
++    class UniqueLoader(yaml.SafeLoader):
++        pass
++
++    def mapping(loader, node, deep=False):
++        out = {}
++        for a, b in node.value:
++            key = loader.construct_object(a, deep=deep)
++            if key in out:
++                raise ValueError('Duplicate NN monitoring request key')
++            out[key] = loader.construct_object(b, deep=deep)
++        return out
++    UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
++    return cls.model_validate(yaml.load(Path(path).read_text(), Loader=UniqueLoader))
++
++def validate_output(config, root):
++    root = Path(root).expanduser().resolve()
++    pipeline = getattr(config, 'pipeline_dir', None)
++    if pipeline is not None and root.is_relative_to(Path(pipeline).resolve()):
++        raise ValueError('Monitoring output cannot be inside immutable pipeline artifacts')
++    if any(((parent / name).is_file() for parent in [root, *root.parents] for name in ['manifest.json', 'artifact_manifest.json', 'artifacts.json', 'pipeline_manifest.json', 'release.json'])):
++        raise ValueError('Monitoring output cannot be inside sealed artifacts')
++    return root
++
++def label_template(engine, config, *, output_root, check_only=False):
++    from ml_template.monitoring.monitor_inputs import load_batch
++    from ml_template.monitoring.nn_monitoring_contract import context_for
++    from ml_template.monitoring.artifacts import write_json, digest
++    batch = load_batch(engine, config.scoring_batch_id)
++    ctx = context_for(batch, config)
++    if ctx is None:
++        raise ValueError('NN template requires NN batch')
++    root = validate_output(config, output_root)
++    path = root / (config.scoring_batch_id + '_labels_template.csv')
++    if path.exists() or path.with_suffix('.json').exists():
++        raise FileExistsError('Choose a new immutable template output root')
++    report = {'ready': True, 'scoring_batch_id': batch.batch_id, 'n_rows': len(batch.predictions), 'labels_generated': 0, 'files_written': False}
++    if check_only:
++        return report
++    root.mkdir(parents=True, exist_ok=True)
++    frame = pd.DataFrame({batch.key: batch.predictions[batch.key].to_numpy(), 'scoring_batch_id': batch.batch_id, 'y_true': '', 'observed_at': '', 'eligible_at': ''})
++    with path.open('x', encoding='utf-8', newline='') as stream:
++        frame.to_csv(stream, index=False)
++    write_json(path.with_suffix('.json'), {**report, 'files_written': True, 'nn_context': ctx, 'target_unit': config.target_unit, 'output_sha256': digest(path), 'instruction': 'Fill genuine measured y_true and observed_at only when known. Fill actual timezone-aware eligible_at for every row. Blank eligibility makes this deliberately unready for import.'})
++    return {**report, 'files_written': True, 'template_path': str(path)}
++
++def run(engine, operation, config, *, output_root, check_only=True):
++    root = validate_output(config, output_root)
++    if operation == 'template':
++        return label_template(engine, config, output_root=root, check_only=check_only)
++    if operation == 'report':
++        from ml_template.usage_dashboard.monitoring_data import load_assessment
++        from ml_template.usage_dashboard.nn_monitor_report import bundle_bytes
++        view = load_assessment(engine, config.monitoring_id)
++        path = root / (config.monitoring_id + '.zip')
++        if path.exists():
++            raise FileExistsError('Report output exists')
++        if check_only:
++            return {'ready': True, 'files_written': False}
++        data = bundle_bytes(view, config.monitoring_id)
++        root.mkdir(parents=True, exist_ok=True)
++        with path.open('xb') as stream:
++            stream.write(data)
++        return {'report_path': str(path), 'files_written': True}
++    from ml_template.monitoring.reference import build_reference
++    from ml_template.monitoring.label_inputs import import_labels
++    from ml_template.monitoring.monitor_batch import evaluate
++    return {'reference': build_reference, 'labels': import_labels, 'monitor': evaluate}[operation](engine, config, output_root=root, check_only=check_only)
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--operation', required=True, choices=['reference', 'labels', 'monitor', 'template', 'report'])
++    parser.add_argument('--config', required=True, type=Path)
++    parser.add_argument('--database', type=Path, default=Path('data/project.db'))
++    parser.add_argument('--output-root', type=Path, default=Path('artifacts/monitoring'))
++    mode = parser.add_mutually_exclusive_group(required=True)
++    mode.add_argument('--check', action='store_true')
++    mode.add_argument('--execute', action='store_true')
++    args = parser.parse_args(argv)
++    cls = {'reference': NNReferenceConfig, 'labels': NNLabelConfig, 'monitor': NNMonitorConfig, 'template': NNTemplateConfig, 'report': ReportConfig}[args.operation]
++    config = load_request(args.config, cls)
++    database = args.database.expanduser().resolve()
++    if not database.is_file():
++        raise FileNotFoundError(database)
++    if args.operation == 'report':
++        print(json.dumps(run(database, args.operation, config, output_root=args.output_root, check_only=args.check), indent=2, allow_nan=False))
++        return
++    with sqlite3.connect(database.as_uri() + ('?mode=ro' if args.check else '?mode=rw'), uri=True) as connection:
++        print(json.dumps(run(connection, args.operation, config, output_root=args.output_root, check_only=args.check), indent=2, allow_nan=False))
++if __name__ == '__main__':
++    main()
+diff --git a/src/ml_template/usage_dashboard/nn_monitor_report.py b/src/ml_template/usage_dashboard/nn_monitor_report.py
+new file mode 100644
+--- /dev/null
++++ b/src/ml_template/usage_dashboard/nn_monitor_report.py
+@@ -0,0 +1,59 @@
++"""Pure saved monitoring report/figure helpers. No model or source-label reads."""
++import csv
++import hashlib
++import html
++import io
++import json
++import zipfile
++
++def metric_rows(perf):
++    if not perf:
++        return []
++    out = []
++    for variant, metrics in perf.get('score_metrics', {}).items():
++        for metric, value in metrics.items():
++            if metric == 'residual_quantiles':
++                out.extend(({'variant': variant, 'metric': 'residual_q' + str(q), 'value': v, 'n_evaluated': perf['n_evaluated'], 'sufficient_support': perf['sufficient_support']} for q, v in value.items()))
++            else:
++                out.append({'variant': variant, 'metric': metric, 'value': value, 'n_evaluated': perf['n_evaluated'], 'sufficient_support': perf['sufficient_support']})
++    for level, metrics in perf.get('interval_metrics', {}).items():
++        out.extend(({'variant': 'prediction_interval', 'level': level, 'metric': metric, 'value': value, 'n_evaluated': metrics['n_evaluated'], 'sufficient_support': perf['sufficient_support']} for metric, value in metrics.items() if metric != 'n_evaluated'))
++    return out
++
++def regression_history(rows):
++    import plotly.graph_objects as go
++    from plotly.subplots import make_subplots
++    fig = make_subplots(specs=[[{'secondary_y': True}]])
++    for name in ['rmse', 'mae', 'bias']:
++        fig.add_trace(go.Scatter(x=[r['as_of'] for r in rows], y=[r.get(name) for r in rows], mode='markers', name=name, text=[str(r['scoring_batch_id']) + ' | support=' + str(r['support']) for r in rows]), secondary_y=False)
++    fig.add_trace(go.Scatter(x=[r['as_of'] for r in rows], y=[r.get('coverage') for r in rows], mode='markers', name='mature label coverage'), secondary_y=True)
++    fig.update_yaxes(title_text='Errors / signed bias (' + str(rows[0]['target_unit']) + ')', secondary_y=False)
++    fig.update_yaxes(title_text='Mature label coverage', range=[0, 1], secondary_y=True)
++    fig.update_layout(title='Saved regression history; support in hover, not independent replications', xaxis_title='Assessment as-of')
++    return fig
++
++def bundle_bytes(view, identity):
++    from ml_template.monitoring.nn_monitoring_contract import validate_frozen_view
++    validate_frozen_view(view)
++    document = {k: view[k] for k in ['summary', 'config', 'quality', 'drift', 'performance', 'findings']}
++    if document['summary']['monitoring_id'] != identity:
++        raise ValueError('Report identity differs')
++    members = {name + '.json': json.dumps(value, indent=2, allow_nan=False).encode() for name, value in document.items()}
++    body = html.escape(json.dumps(document, indent=2, allow_nan=False))
++    members['report.html'] = ('<!doctype html><meta charset="utf-8"><title>Saved monitoring report</title><h1>Saved monitoring evidence</h1><p>Verified saved artifacts only; no new scoring, fitting or evaluation. No warning is not proof of health.</p><pre>' + body + '</pre>').encode()
++    perf = view['performance']
++    rows = metric_rows(perf) if (perf or {}).get('task') == 'regression' else [{'variant': variant, 'metric': metric, 'value': value, 'n_evaluated': perf['n_evaluated'], 'sufficient_support': perf['sufficient_support']} for variant, metrics in (perf or {}).get('score_metrics', {}).items() for metric, value in metrics.items()]
++    stream = io.StringIO()
++    columns = ['variant', 'level', 'metric', 'value', 'n_evaluated', 'sufficient_support']
++    writer = csv.DictWriter(stream, fieldnames=columns)
++    writer.writeheader()
++    for row in rows:
++        safe = {k: "'" + v if isinstance(v, str) and v[:1] in {'=', '+', '-', '@'} else v for k, v in row.items()}
++        writer.writerow(safe)
++    members['metrics.csv'] = stream.getvalue().encode()
++    members['SHA256SUMS.json'] = json.dumps({k: hashlib.sha256(v).hexdigest() for k, v in members.items()}, indent=2).encode()
++    result = io.BytesIO()
++    with zipfile.ZipFile(result, 'w', zipfile.ZIP_DEFLATED) as archive:
++        for name, value in members.items():
++            archive.writestr(name, value)
++    return result.getvalue()
+diff --git a/tests/monitoring/test_nn_lifecycle_06.py b/tests/monitoring/test_nn_lifecycle_06.py
+new file mode 100644
+--- /dev/null
++++ b/tests/monitoring/test_nn_lifecycle_06.py
+@@ -0,0 +1,201 @@
++"""Pure NN lineage, unit, maturity-support and report integrity tests."""
++import copy
++import hashlib
++import json
++import zipfile
++from io import BytesIO
++from pathlib import Path
++from types import SimpleNamespace
++import pandas as pd
++import pytest
++from ml_template.monitoring.nn_monitoring_contract import release_binding, verify_pipeline, context_for, validate_saved_context, assessment_scope, validate_frozen_view
++from ml_template.usage_dashboard.nn_monitor_report import bundle_bytes, metric_rows
++
++def sha(path):
++    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
++
++def world(tmp_path, mode='canonical'):
++    root = tmp_path / 'nnpipe_unit'
++    score = root / 'scores/score1'
++    score.mkdir(parents=True)
++    (score / 'predictions.parquet').write_bytes(b'metadata-only unit fixture')
++    (score / 'artifacts.json').write_text('{}')
++    release = {'release_id': 'rel_' + '0' * 24, 'content_sha256': 'c' * 64, 'target_unit': 'MPa', 'parent_run_id': 'run1', 'evaluation_id': 'eval1', 'calibration_id': None, 'release_variant': 'raw', 'predictor_kind': 'final', 'interval_columns': {}}
++    binding = {'schema_version': 1, 'release': release, 'score': {'scoring_batch_id': 'score1', 'input_sha256': 'a' * 64, 'n_rows': 4, 'predictions_sha256': sha(score / 'predictions.parquet'), 'artifacts_sha256': sha(score / 'artifacts.json')}}
++    input_sha = binding['score']['input_sha256']
++    if mode == 'raw':
++        prep = root / 'prepared'
++        prep.mkdir()
++        (prep / 'raw_input.csv').write_text('id,a\n1,2\n')
++        (prep / 'data.parquet').write_bytes(b'canonical fixture')
++        input_sha = sha(prep / 'raw_input.csv')
++        binding['score']['input_sha256'] = sha(prep / 'data.parquet')
++        (prep / 'manifest.json').write_text(json.dumps({'input_sha256': input_sha, 'release_id': release['release_id'], 'canonical_sha256': binding['score']['input_sha256']}))
++    state = {'pipeline_id': root.name, 'status': 'succeeded', 'stage': 'complete', 'predictions_computed': True, 'labels_loaded': False, 'evaluation_executed': False, 'release_built': False, 'task': 'regression', 'model_type': 'nn', 'release_id': release['release_id'], 'release_content_sha256': release['content_sha256'], 'target_unit': 'MPa', 'parent_run_id': 'run1', 'evaluation_id': 'eval1', 'calibration_id': None, 'release_variant': 'raw', 'interval_columns': {}, 'scoring_batch_id': 'score1', 'predictions_sha256': binding['score']['predictions_sha256'], 'scoring_manifest_sha256': binding['score']['artifacts_sha256'], 'n_rows': 4, 'scoring_dir': str(score), 'input_format': mode, 'input_sha256': input_sha}
++    (root / 'pipeline.json').write_text(json.dumps(state))
++    manifest(root)
++    batch = SimpleNamespace(summary={'model_type': 'nn', 'target_unit': 'MPa', 'nn_binding': binding}, record={'artifact_dir': str(score)})
++    config = SimpleNamespace(pipeline_dir=root, expected_pipeline_id=root.name, expected_pipeline_manifest_sha256=sha(root / 'pipeline_manifest.json'), target_unit='MPa')
++    return (root, state, batch, config)
++
++def manifest(root):
++    entries = {p.relative_to(root).as_posix(): {'sha256': sha(p), 'bytes': p.stat().st_size} for p in root.rglob('*') if p.is_file() and p.name != 'pipeline_manifest.json'}
++    (root / 'pipeline_manifest.json').write_text(json.dumps({'schema_version': 1, 'files': entries}))
++
++@pytest.mark.parametrize('mode', ['raw', 'canonical'])
++def test_verified_lineage_without_prediction_decode(tmp_path, mode):
++    root, _, batch, config = world(tmp_path, mode)
++    ctx = context_for(batch, config)
++    assert ctx['pipeline_manifest_sha256'] == sha(root / 'pipeline_manifest.json') and ctx['model_loaded'] is False
++
++@pytest.mark.parametrize('field,value', [('status', 'failed'), ('stage', 'export'), ('target_unit', 'wrong'), ('release_id', 'wrong'), ('evaluation_id', 'wrong'), ('calibration_id', 'other'), ('scoring_batch_id', 'other'), ('predictions_computed', False), ('labels_loaded', True), ('evaluation_executed', True), ('release_built', True), ('n_rows', 99)])
++def test_rehashed_wrong_envelope_identity_rejected(tmp_path, field, value):
++    root, state, batch, config = world(tmp_path)
++    state[field] = value
++    (root / 'pipeline.json').write_text(json.dumps(state))
++    manifest(root)
++    with pytest.raises(ValueError):
++        verify_pipeline(root, root.name, sha(root / 'pipeline_manifest.json'), batch)
++
++@pytest.mark.parametrize('kind', ['manifest', 'prediction', 'unlisted', 'identity', 'directory', 'units', 'missing_context'])
++def test_context_failures(tmp_path, kind):
++    root, _, batch, config = world(tmp_path)
++    if kind == 'manifest':
++        config.expected_pipeline_manifest_sha256 = 'f' * 64
++    elif kind == 'prediction':
++        (root / 'scores/score1/predictions.parquet').write_bytes(b'changed')
++    elif kind == 'unlisted':
++        (root / 'extra').write_text('x')
++    elif kind == 'identity':
++        config.expected_pipeline_id = 'nnpipe_other'
++    elif kind == 'directory':
++        batch.record['artifact_dir'] = str(tmp_path / 'other')
++    elif kind == 'units':
++        config.target_unit = 'wrong'
++    else:
++        config = SimpleNamespace(target_unit='MPa')
++    with pytest.raises(ValueError):
++        context_for(batch, config)
++
++def test_reference_can_bind_another_batch_of_same_release(tmp_path):
++    _, _, batch, config = world(tmp_path)
++    ctx = context_for(batch, config)
++    other = copy.deepcopy(batch)
++    other.summary['nn_binding']['score']['scoring_batch_id'] = 'score2'
++    validate_saved_context({'nn_context': ctx}, other)
++    with pytest.raises(ValueError):
++        validate_saved_context({'nn_context': ctx}, other, same_batch=True)
++
++def test_reference_cannot_cross_release(tmp_path):
++    _, _, batch, config = world(tmp_path)
++    ctx = context_for(batch, config)
++    other = copy.deepcopy(batch)
++    other.summary['nn_binding']['release']['target_unit'] = 'other'
++    with pytest.raises(ValueError):
++        validate_saved_context({'nn_context': ctx}, other)
++
++def test_missing_saved_context_rejected(tmp_path):
++    _, _, batch, _ = world(tmp_path)
++    with pytest.raises(ValueError):
++        validate_saved_context({}, batch)
++
++def test_legacy_classification_context_unchanged():
++    assert context_for(SimpleNamespace(summary={'task': 'binary_classification'}), SimpleNamespace()) is None
++
++def config():
++    return SimpleNamespace(min_rows=200, min_labelled=100, min_label_coverage=0.9)
++
++@pytest.mark.parametrize('case,expected', [('none', 'unknown_no_labels'), ('zero', 'not_assessed_no_mature_observed_outcomes'), ('support', 'not_assessed_insufficient_outcomes'), ('coverage', 'not_assessed_label_coverage'), ('selected', 'not_assessed_selected_or_unknown_sampling'), ('good', 'assessed_mature_labelled_subset')])
++def test_explicit_assessment_status(case, expected):
++    perf = None if case == 'none' else {'n_evaluated': 0 if case == 'zero' else 120, 'sufficient_support': case != 'support', 'mature_label_coverage': 0.5 if case == 'coverage' else 1.0}
++    s = assessment_scope(config(), perf, 'selected' if case == 'selected' else 'all_rows', 10, 10)
++    assert s['performance_status'] == expected and s['distribution_status'] == 'not_assessed_insufficient_rows' and (s['automatic_promotion'] is False)
++
++def test_distribution_status_independent_of_label_status():
++    s = assessment_scope(config(), None, None, 500, 300)
++    assert s['distribution_status'] == 'descriptive' and s['performance_status'] == 'unknown_no_labels'
++
++def frozen_view(tmp_path):
++    _, _, batch, cfg = world(tmp_path)
++    ctx = context_for(batch, cfg)
++    c = {**vars(config()), 'expected_pipeline_id': cfg.expected_pipeline_id, 'expected_pipeline_manifest_sha256': cfg.expected_pipeline_manifest_sha256, 'target_unit': 'MPa'}
++    summary = {'monitoring_id': 'mon1', 'model_type': 'nn', 'target_unit': 'MPa', 'release_id': ctx['nn_binding']['release']['release_id'], 'scoring_batch_id': 'score1', 'nn_context': ctx, 'n_rows': 4, 'label_sampling': None, 'assessment_scope': assessment_scope(config(), None, None, 4, 4)}
++    return {'summary': summary, 'config': c, 'performance': None, 'quality': {'n_rows': 4}, 'drift': [], 'findings': [{'message': '<script>unsafe</script>'}]}
++
++def test_frozen_scope_and_report_export(tmp_path):
++    view = frozen_view(tmp_path)
++    validate_frozen_view(view)
++    data = bundle_bytes(view, 'mon1')
++    with zipfile.ZipFile(BytesIO(data)) as z:
++        assert z.testzip() is None and '<script>unsafe' not in z.read('report.html').decode()
++        checks = json.loads(z.read('SHA256SUMS.json'))
++        assert all((hashlib.sha256(z.read(n)).hexdigest() == v for n, v in checks.items()))
++
++@pytest.mark.parametrize('kind', ['unit', 'pipeline', 'scope', 'batch'])
++def test_frozen_scope_tampering(tmp_path, kind):
++    view = frozen_view(tmp_path)
++    if kind == 'unit':
++        view['summary']['target_unit'] = 'wrong'
++    elif kind == 'pipeline':
++        view['config']['expected_pipeline_id'] = 'wrong'
++    elif kind == 'scope':
++        view['summary']['assessment_scope']['performance_status'] = 'healthy'
++    else:
++        view['summary']['scoring_batch_id'] = 'wrong'
++    with pytest.raises(ValueError):
++        validate_frozen_view(view)
++
++def test_regression_metrics_rows_do_not_require_class_counts():
++    perf = {'task': 'regression', 'n_evaluated': 4, 'sufficient_support': False, 'score_metrics': {'y_pred_release': {'rmse': 1.0, 'bias': -0.5, 'r2': None, 'residual_quantiles': {'.5': 0.2}}}, 'interval_metrics': {'c800000': {'n_evaluated': 4, 'nominal_coverage': 0.8, 'empirical_coverage': 0.75, 'mean_width': 3.0}}}
++    rows = metric_rows(perf)
++    assert any((r['metric'] == 'bias' and r['value'] == -0.5 for r in rows))
++    assert any((r.get('level') == 'c800000' for r in rows))
++    assert all((r['sufficient_support'] is False for r in rows))
++
++@pytest.mark.parametrize('kind', ['reference', 'labels', 'monitor', 'template'])
++def test_context_request_models(kind, tmp_path):
++    from ml_template.monitoring.nn_monitor import NNReferenceConfig, NNLabelConfig, NNMonitorConfig, NNTemplateConfig
++    common = {'pipeline_dir': tmp_path, 'expected_pipeline_id': 'nnpipe_unit', 'expected_pipeline_manifest_sha256': 'a' * 64, 'scoring_batch_id': 'score1', 'target_unit': 'MPa'}
++    if kind == 'reference':
++        obj = NNReferenceConfig(**common, name='unit', approved_population='Synthetic only')
++    elif kind == 'labels':
++        obj = NNLabelConfig(**common, input_path='labels.csv', source='synthetic', outcome_definition='synthetic', sampling='all_rows')
++    elif kind == 'monitor':
++        obj = NNMonitorConfig(**common, reference_id='ref1', as_of='2026-01-03T00:00:00+00:00')
++    else:
++        obj = NNTemplateConfig(**common)
++    assert obj.model_dump(mode='json')['expected_pipeline_manifest_sha256'] == 'a' * 64
++
++def test_context_requests_reject_missing_units():
++    from ml_template.monitoring.nn_monitor import NNTemplateConfig
++    with pytest.raises(ValueError):
++        NNTemplateConfig(pipeline_dir='x', expected_pipeline_id='nnpipe_unit', expected_pipeline_manifest_sha256='a' * 64, scoring_batch_id='score1')
++
++def test_report_wrong_identity_rejected(tmp_path):
++    with pytest.raises(ValueError):
++        bundle_bytes(frozen_view(tmp_path), 'other_monitor')
++
++@pytest.mark.parametrize('kind', ['valid', 'wrong_unit', 'wrong_parent', 'wrong_descriptor'])
++def test_raw_nn_units_bound_from_release_without_mutating_score(tmp_path, kind):
++    release = tmp_path / 'release'
++    release.mkdir()
++    info = {'model_type': 'nn', 'task': 'regression', 'prediction_kind': 'continuous', 'target_unit': 'MPa', 'parent_run_id': 'run1', 'evaluation_id': 'eval1', 'calibration_id': None, 'release_variant': 'raw', 'predictor_kind': 'final', 'prediction_columns': {'raw': 'y_pred_raw', 'release': 'y_pred_release'}}
++    summary = {'parent_run_id': 'run1', 'calibration_id': None, 'release_variant': 'raw', 'prediction_columns': info['prediction_columns']}
++    descriptor = {'schema_version': 3, 'model_type': 'nn', 'kind': 'final'}
++    if kind == 'wrong_unit':
++        summary['target_unit'] = 'wrong'
++    elif kind == 'wrong_parent':
++        summary['parent_run_id'] = 'other'
++    elif kind == 'wrong_descriptor':
++        descriptor['kind'] = 'cv_mean'
++    for name, value in [('release.json', info), ('predictor.json', descriptor), ('runtime.json', {})]:
++        (release / name).write_text(json.dumps(value))
++    record = {'release_id': 'rel1', 'scoring_batch_id': 'score1', 'input_sha256': 'a' * 64, 'n_rows': 4}
++    before = copy.deepcopy(summary)
++    if kind == 'valid':
++        result = release_binding(summary, info, {'content_sha256': 'c' * 64}, record, release, {'predictions.parquet': {'sha256': 'b' * 64}}, 'd' * 64)
++        assert result['target_unit'] == 'MPa' and 'target_unit' not in summary and (result['nn_binding']['release']['evaluation_id'] == 'eval1')
++        assert result['model_type'] == 'nn' and summary == before
++    else:
++        with pytest.raises(ValueError):
++            release_binding(summary, info, {'content_sha256': 'c' * 64}, record, release, {'predictions.parquet': {'sha256': 'b' * 64}}, 'd' * 64)
+diff --git a/tests/monitoring/test_nn_lifecycle_06_native.py b/tests/monitoring/test_nn_lifecycle_06_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/monitoring/test_nn_lifecycle_06_native.py
+@@ -0,0 +1,99 @@
++"""Native NN scored artifacts -> reference/labels/monitor -> read-only usage/report."""
++import importlib.util
++import sys
++from pathlib import Path
++import numpy as np
++import pandas as pd
++import pytest
++_path = Path(__file__).parents[1] / 'scoring' / 'test_nn_lifecycle_05_native.py'
++_spec = importlib.util.spec_from_file_location('nn_package_06_training_fixture', _path)
++_module = importlib.util.module_from_spec(_spec)
++sys.modules[_spec.name] = _module
++_spec.loader.exec_module(_module)
++trained = _module.trained
++_microbatch_before_training = _module._microbatch_before_synthetic_training
++
++@pytest.mark.parametrize('kind', ['final', 'cv_mean'])
++@pytest.mark.parametrize('corrected', [False, True], ids=['raw', 'bias_intervals'])
++def test_native_nn_monitoring(trained, tmp_path, monkeypatch, kind, corrected):
++    from ml_template.scoring.nn_batch_pipeline import BatchRequest, run_pipeline
++    from ml_template.monitoring.artifacts import digest
++    from ml_template.monitoring.nn_monitor import NNReferenceConfig, NNLabelConfig, NNMonitorConfig, NNTemplateConfig, run
++    from ml_template.monitoring.nn_monitoring_contract import context_for
++    from ml_template.monitoring.monitor_inputs import load_batch
++    from ml_template.usage_dashboard.monitoring_data import load_assessment, metric_rows
++    from ml_template.usage_dashboard.monitoring_page import monitoring_payload
++    from ml_template.usage_dashboard.nn_monitor_report import bundle_bytes
++    release, root = _module.build(trained, tmp_path, kind, corrected)
++    frame = pd.DataFrame({'id': [9001, 9002, 9003, 9004], 'a': [1.1, 2.2, np.nan, 3.3], 'b': [2.0, np.nan, 3.0, 1.0], 'k': ['u', 'v', None, 'u']})
++    source = tmp_path / 'unlabelled.csv'
++    frame.to_csv(source, index=False)
++    batch_request = BatchRequest(release_dir=release['artifact_dir'], expected_release_id=release['release_id'], input_path=str(source), input_format='canonical', runtime_source_root=str(root), runtime_python=sys.executable, database=str(tmp_path / 'project.db'), output_root=str(tmp_path / 'jobs'), acknowledge_research_scoring=True, timeout_s=180)
++    pipeline = run_pipeline(batch_request, check_only=False)
++    directory = Path(pipeline['artifact_dir'])
++    pipeline_hash = digest(directory / 'pipeline_manifest.json')
++    common = {'pipeline_dir': directory, 'expected_pipeline_id': pipeline['pipeline_id'], 'expected_pipeline_manifest_sha256': pipeline_hash, 'scoring_batch_id': pipeline['scoring_batch_id'], 'target_unit': 'synthetic_units'}
++    prediction = pd.read_parquet(pipeline['predictions_path'])
++    before = digest(tmp_path / 'project.db')
++    monkeypatch.setattr(trained['torch'], 'load', lambda *a, **k: pytest.fail('monitoring/UI loaded model weights'))
++    reference = NNReferenceConfig(**common, name='synthetic_reference', approved_population='Synthetic plumbing only; not a representative deployment claim')
++    checked = run(trained['engine'], 'reference', reference, output_root=tmp_path / 'refs', check_only=True)
++    assert checked['ready'] and (not (tmp_path / 'refs').exists()) and (before == digest(tmp_path / 'project.db'))
++    ref = run(trained['engine'], 'reference', reference, output_root=tmp_path / 'refs', check_only=False)
++    template = run(trained['engine'], 'template', NNTemplateConfig(**common), output_root=tmp_path / 'templates', check_only=False)
++    t = pd.read_csv(template['template_path'])
++    assert t.y_true.isna().all() and t.observed_at.isna().all() and t.eligible_at.isna().all()
++    config = NNMonitorConfig(**common, reference_id=ref['reference_id'], as_of='2026-01-03T00:00:00+00:00')
++    monitored = run(trained['engine'], 'monitor', config, output_root=tmp_path / 'monitoring', check_only=False)
++    view = load_assessment(tmp_path / 'project.db', monitored['monitoring_id'])
++    assert view['performance'] is None and view['summary']['model_type'] == 'nn'
++    assert view['summary']['assessment_scope']['performance_status'] == 'unknown_no_labels'
++    assert view['summary']['assessment_scope']['distribution_status'] == 'not_assessed_insufficient_rows'
++    assert view['summary']['target_unit'] == 'synthetic_units'
++    labels = pd.DataFrame({'id': prediction.id, 'scoring_batch_id': pipeline['scoring_batch_id'], 'y_true': prediction.y_pred_release.to_numpy() + np.array([0.0, 1.0, -1.0, 2.0]), 'observed_at': '2026-01-02T00:00:00+00:00', 'eligible_at': '2026-01-01T00:00:00+00:00'})
++    label_path = tmp_path / 'synthetic_labels.csv'
++    labels.to_csv(label_path, index=False)
++    request = NNLabelConfig(**common, input_path=label_path, source='Synthetic test only', outcome_definition='Synthetic residual arithmetic', sampling='all_rows')
++    imported = run(trained['engine'], 'labels', request, output_root=tmp_path / 'labels', check_only=False)
++    labelled = NNMonitorConfig(**common, reference_id=ref['reference_id'], label_import_id=imported['label_import_id'], as_of='2026-01-03T00:00:00+00:00', min_rows=2, min_labelled=2, rmse_warning=1.0, abs_bias_warning=0.1)
++    assessed = run(trained['engine'], 'monitor', labelled, output_root=tmp_path / 'labelled_monitoring', check_only=False)
++    saved = load_assessment(tmp_path / 'project.db', assessed['monitoring_id'])
++    perf = saved['performance']
++    assert saved['summary']['assessment_scope']['performance_status'] == 'assessed_mature_labelled_subset'
++    assert perf['score_metrics']['y_pred_release']['rmse'] == pytest.approx(np.sqrt(1.5))
++    assert perf['score_metrics']['y_pred_release']['bias'] == pytest.approx(-0.5)
++    assert any((r['metric'] == 'bias' for r in metric_rows(perf)))
++    if corrected:
++        assert perf['interval_metrics']
++    payload = monitoring_payload(tmp_path / 'project.db', assessed['monitoring_id'])
++    assert len(payload) == 10 and 'unavailable' not in payload[0].lower() and ('NN assessment scope' in payload[8])
++    assert bundle_bytes(saved, assessed['monitoring_id'])[:2] == b'PK'
++    partial = labels.copy()
++    partial.loc[0, 'eligible_at'] = '2026-01-10T00:00:00+00:00'
++    partial.loc[1, 'observed_at'] = '2026-01-10T00:00:00+00:00'
++    partial.loc[2, 'y_true'] = np.nan
++    partial.loc[2, 'observed_at'] = None
++    partial_path = tmp_path / 'synthetic_partial.csv'
++    partial.to_csv(partial_path, index=False)
++    revised_labels = NNLabelConfig(**common, input_path=partial_path, source='Synthetic partial only', outcome_definition='Synthetic residual arithmetic', sampling='selected', supersedes_label_import_id=imported['label_import_id'])
++    partial_id = run(trained['engine'], 'labels', revised_labels, output_root=tmp_path / 'partial_labels', check_only=False)['label_import_id']
++    partial_config = NNMonitorConfig(**common, reference_id=ref['reference_id'], label_import_id=partial_id, as_of='2026-01-03T00:00:00+00:00', min_rows=2, min_labelled=2, rmse_warning=0.0, abs_bias_warning=0.0)
++    partial_mon = run(trained['engine'], 'monitor', partial_config, output_root=tmp_path / 'partial_monitoring', check_only=False)
++    partial_view = load_assessment(tmp_path / 'project.db', partial_mon['monitoring_id'])
++    assert partial_view['performance']['n_evaluated'] == 1
++    assert partial_view['performance']['mature_label_coverage'] == pytest.approx(1 / 3)
++    assert partial_view['summary']['assessment_scope']['performance_status'] == 'not_assessed_insufficient_outcomes'
++    assert not any((f['rule'] in {'rmse_warning', 'mae_warning', 'abs_bias_warning', 'interval_undercoverage'} for f in partial_view['findings']))
++    second = run_pipeline(batch_request, check_only=False)
++    second_common = {**common, 'pipeline_dir': Path(second['artifact_dir']), 'expected_pipeline_id': second['pipeline_id'], 'expected_pipeline_manifest_sha256': digest(Path(second['artifact_dir']) / 'pipeline_manifest.json'), 'scoring_batch_id': second['scoring_batch_id']}
++    second_monitor = NNMonitorConfig(**second_common, reference_id=ref['reference_id'], as_of='2026-01-03T00:00:00+00:00')
++    assert run(trained['engine'], 'monitor', second_monitor, output_root=tmp_path / 'second_monitoring', check_only=True)['ready']
++    bad = reference.model_copy(update={'expected_pipeline_manifest_sha256': 'f' * 64})
++    with pytest.raises(ValueError):
++        run(trained['engine'], 'reference', bad, output_root=tmp_path / 'bad_refs', check_only=True)
++    assert not (tmp_path / 'bad_refs').exists()
++    batch = load_batch(trained['engine'], pipeline['scoring_batch_id'])
++    wrong = reference.model_copy(update={'target_unit': 'wrong'})
++    with pytest.raises(ValueError):
++        context_for(batch, wrong)
++    assert pipeline_hash == digest(directory / 'pipeline_manifest.json')
+diff --git a/configs/monitoring/nn_package_06_reference.example.yaml b/configs/monitoring/nn_package_06_reference.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_reference.example.yaml
+@@ -0,0 +1,8 @@
++pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
++expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
++expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
++scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
++target_unit: MPa
++name: nn_explicit_reference
++approved_population: "REPLACE with a truthful population declaration; a demo batch is plumbing only"
++numeric_bins: 10
+diff --git a/configs/monitoring/nn_package_06_template.example.yaml b/configs/monitoring/nn_package_06_template.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_template.example.yaml
+@@ -0,0 +1,5 @@
++pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
++expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
++expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
++scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
++target_unit: MPa
+diff --git a/configs/monitoring/nn_package_06_labels.example.yaml b/configs/monitoring/nn_package_06_labels.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_labels.example.yaml
+@@ -0,0 +1,9 @@
++pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
++expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
++expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
++scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
++target_unit: MPa
++input_path: data/labels/REPLACE_WITH_MEASURED_OUTCOMES.csv
++source: "REPLACE with actual measurement source"
++outcome_definition: "Measured compressive strength at the row's specified age, MPa"
++sampling: unknown
+diff --git a/configs/monitoring/nn_package_06_unlabelled.example.yaml b/configs/monitoring/nn_package_06_unlabelled.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_unlabelled.example.yaml
+@@ -0,0 +1,11 @@
++pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
++expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
++expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
++scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
++target_unit: MPa
++reference_id: ref_REPLACE_WITH_APPROVED_REFERENCE_ID
++label_import_id: null
++as_of: 2026-11-12T18:10:00+08:00
++min_rows: 200
++min_labelled: 100
++min_label_coverage: 0.9
+diff --git a/configs/monitoring/nn_package_06_labelled.example.yaml b/configs/monitoring/nn_package_06_labelled.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_labelled.example.yaml
+@@ -0,0 +1,16 @@
++pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
++expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
++expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
++scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
++target_unit: MPa
++reference_id: ref_REPLACE_WITH_APPROVED_REFERENCE_ID
++label_import_id: labels_REPLACE_WITH_ACTUAL_IMPORT_ID
++as_of: 2026-11-12T18:10:00+08:00
++min_rows: 200
++min_labelled: 100
++min_label_coverage: 0.9
++# Set unit-aware warning limits only through an explicit protocol, not demo outcomes.
++rmse_warning: null
++mae_warning: null
++abs_bias_warning: null
++interval_coverage_slack: 0.05
+diff --git a/configs/monitoring/nn_package_06_report.example.yaml b/configs/monitoring/nn_package_06_report.example.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/monitoring/nn_package_06_report.example.yaml
+@@ -0,0 +1 @@
++monitoring_id: mon_REPLACE_WITH_SUCCESSFUL_MONITORING_ID

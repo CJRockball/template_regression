@@ -10,6 +10,9 @@ from ml_template.monitoring.monitor_inputs import load_batch
 
 def build_reference(engine, config, *, output_root, check_only=False):
     batch = load_batch(engine, config.scoring_batch_id)
+    from ml_template.monitoring.nn_monitoring_contract import context_for
+
+    nn_context = context_for(batch, config)
     from ml_template.monitoring.nullable_drift import nullable_profile
     from ml_template.monitoring.regression import validate_options
 
@@ -53,6 +56,7 @@ def build_reference(engine, config, *, output_root, check_only=False):
         "source_hashes": batch.artifact_hashes,
         "flagged_fraction": batch.summary.get("flagged_fraction"),
         "n_rows": len(batch.source),
+        **({"nn_context": nn_context} if nn_context is not None else {}),
     }
     write_json(directory / "config.json", config.model_dump(mode="json"))
     write_json(directory / "reference.json", result)
@@ -85,4 +89,7 @@ def load_reference(engine, identity, batch):
         raise ValueError("reference task differs from batch")
     if result["release_id"] != batch.release_id or result["contract"] != batch.contract:
         raise ValueError("reference must use the same release and source contract")
+    from ml_template.monitoring.nn_monitoring_contract import validate_saved_context
+
+    validate_saved_context(result, batch)
     return result

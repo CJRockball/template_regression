@@ -1,0 +1,74 @@
+{
+  "src/ml_template/monitoring/monitor_inputs.py": {
+    "before": "ecb1bb4c6d67e74d2abac716474ab10214aa09c8ba00117ea1b8e78f0fd887eb",
+    "after": "d9c54dabd97db883f9451430153720adfeecbbc906b5d0a8c18b27051619848a"
+  },
+  "src/ml_template/monitoring/reference.py": {
+    "before": "f6f07d3421f5b647497945cc4b9d5e92cc06d528458d69f2cc2c1bfaaac3899f",
+    "after": "640e8e6b4a37ec5509c3e175203f313bfc14cefe2f223bbd527f3fe70b68cfe6"
+  },
+  "src/ml_template/monitoring/label_inputs.py": {
+    "before": "98e6aef090afb0e496ff193bf0875a1c9396f593a1f89bae17719961090cacb7",
+    "after": "ff30e7db0ffcbbd66d214bbd1d3c472a989f9a8e2390063231f814dca5af95a1"
+  },
+  "src/ml_template/monitoring/monitor_batch.py": {
+    "before": "86bf87f7f9ffd092923ab97d7e0836e63be0c99dd0cdbc04a8168207d16e64f9",
+    "after": "c3d9dfa18c11b36e4c4ff8229c93693d31e6a5a415a7580d2a5f7a1a1779f77e"
+  },
+  "src/ml_template/usage_dashboard/monitoring_data.py": {
+    "before": "b99fb12df5d74f6a353fc2c643869dc7369856c0eaaee9dfc7d5d5725f998f2b",
+    "after": "44e65893ec736b1224356617dcbb18d86b1fd09fda3a059ae54950175429b194"
+  },
+  "src/ml_template/usage_dashboard/monitoring_figures.py": {
+    "before": "17d8dd34047f5e992ad0578bc0b4ea2b49562830ecf1c6d52aae6b33e3dc2047",
+    "after": "2ae2e86b53683e48a5fa2b741b2de851611e8470995a99fbbda8f76eaed99433"
+  },
+  "src/ml_template/usage_dashboard/monitoring_page.py": {
+    "before": "94c5aa9af75df21ee36cfae713d359f4467f9c6c6b280e4b5b06e846fb65811c",
+    "after": "2d0ea5d4e542b8f7f8cb1dd865eaf96dc850d9ef9adf3b82d153516688974d45"
+  },
+  "src/ml_template/monitoring/nn_monitoring_contract.py": {
+    "before": null,
+    "after": "d028974c2a22cf3020dc21b5f2599614d23797dfe8c762587a2ead84512db072"
+  },
+  "src/ml_template/monitoring/nn_monitor.py": {
+    "before": null,
+    "after": "f0cb616104eda04cf3815f0083126088a1022dc4ce8798b6804227125cc0495f"
+  },
+  "src/ml_template/usage_dashboard/nn_monitor_report.py": {
+    "before": null,
+    "after": "e66fd429751be98940c934f8a33cea95fbc8cd6738ab034c1b5a4e13b181ddd1"
+  },
+  "tests/monitoring/test_nn_lifecycle_06.py": {
+    "before": null,
+    "after": "f48aa86f09adc1ee0b480fbfc2c0d919f3fcd64c535b11e65367cba70a7ced9c"
+  },
+  "tests/monitoring/test_nn_lifecycle_06_native.py": {
+    "before": null,
+    "after": "060e47c3a8edec3740b38009ed1bfa183d4bcae7ed4144bdc180b7a8226315a5"
+  },
+  "configs/monitoring/nn_package_06_reference.example.yaml": {
+    "before": null,
+    "after": "aad2991640278968c0328569c0f34822e124d525b9c269ab624dbe2817759ea1"
+  },
+  "configs/monitoring/nn_package_06_template.example.yaml": {
+    "before": null,
+    "after": "1b1389171269d50a6d36c569a0bb54207b18da5676df8b4218c1fbc200b8851c"
+  },
+  "configs/monitoring/nn_package_06_labels.example.yaml": {
+    "before": null,
+    "after": "57f74dc8f1918adddf9351a9c56ae76d359b71fadb2c2741a20c579cf585e493"
+  },
+  "configs/monitoring/nn_package_06_unlabelled.example.yaml": {
+    "before": null,
+    "after": "ead5847541efbbb7309b30ed0d14e8c522eaacea5dfb75996e61b98efb0a63dd"
+  },
+  "configs/monitoring/nn_package_06_labelled.example.yaml": {
+    "before": null,
+    "after": "cfd4eb606b2b84bbc08087a517b85e63e9b7ab2faf97917107468d103d382e6f"
+  },
+  "configs/monitoring/nn_package_06_report.example.yaml": {
+    "before": null,
+    "after": "b55f651a663604aafc252bf1b3c98264f45c12e418e8ff9320d6659f5fc89a00"
+  }
+}

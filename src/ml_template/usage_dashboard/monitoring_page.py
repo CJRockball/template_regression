@@ -56,6 +56,15 @@ def monitoring_payload(database, identity):
             notes.append(
                 "Outcome metrics describe the mature labelled subset, not automatically the full population."
             )
+        if summary.get("task") == "regression":
+            notes.append(
+                "Regression bias = prediction minus truth; residual = truth minus prediction. No probability calibration curve applies."
+            )
+        if summary.get("model_type") == "nn":
+            notes.append(
+                "NN assessment scope: " + json.dumps(summary["assessment_scope"], sort_keys=True)
+            )
+            notes.append("Verified Package 05 pipeline: " + summary["nn_context"]["pipeline_id"])
         if errors:
             notes.append("History verification failures: " + " | ".join(errors))
         details = {
@@ -80,7 +89,15 @@ def monitoring_payload(database, identity):
         return (
             json.dumps(summary, indent=2),
             findings,
-            metric_rows(perf),
+            [
+                {
+                    **row,
+                    "target_unit": "dimensionless"
+                    if row.get("metric") in {"r2", "nominal_coverage", "empirical_coverage"}
+                    else summary.get("target_unit"),
+                }
+                for row in metric_rows(perf)
+            ],
             policy_rows(perf),
             view["quality"].get("features", []),
             drift_figure(view["drift"]),
@@ -193,6 +210,10 @@ def monitoring_layout(database):
                 value=options[0]["value"] if options else None,
                 clearable=False,
             ),
+            html.Button(
+                "Export selected saved monitoring report — ZIP", id="mon-report-export", n_clicks=0
+            ),
+            dcc.Download(id="mon-report-download"),
             html.Pre(id="mon-summary"),
             html.Pre(id="mon-notes", style={"whiteSpace": "pre-wrap"}),
             html.H2("Findings"),
@@ -213,6 +234,8 @@ def monitoring_layout(database):
                     "n_positive",
                     "n_negative",
                     "sufficient_support",
+                    "target_unit",
+                    "level",
                 ],
             ),
             dcc.Graph(id="mon-reliability"),
@@ -248,3 +271,19 @@ def register_monitoring_callbacks(app, database):
     )
     def select_assessment(identity):
         return monitoring_payload(database, identity)
+
+    from dash import State, dcc, no_update
+
+    @app.callback(
+        Output("mon-report-download", "data"),
+        Input("mon-report-export", "n_clicks"),
+        State("mon-selection", "value"),
+        prevent_initial_call=True,
+    )
+    def export_selected(clicks, identity):
+        if not clicks or not identity:
+            return no_update
+        from ml_template.usage_dashboard.nn_monitor_report import bundle_bytes
+
+        payload = bundle_bytes(load_assessment(database, identity), identity)
+        return dcc.send_bytes(lambda stream: stream.write(payload), identity + ".zip")

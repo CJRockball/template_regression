@@ -148,6 +148,11 @@ def findings_for(config, *, drift, quality, performance, reference_n, sampling):
 
 def prepare(engine, config):
     batch = load_batch(engine, config.scoring_batch_id)
+    from ml_template.monitoring.nn_monitoring_contract import context_for
+
+    nn_context = context_for(batch, config)
+    if nn_context is not None:
+        batch.summary = {**batch.summary, "nn_context": nn_context}
     reference = load_reference(engine, config.reference_id, batch)
     labels = load_labels(engine, config.label_import_id, batch) if config.label_import_id else None
     quality_report(batch, config.quality_ranges)
@@ -272,6 +277,21 @@ def evaluate(engine, config, *, output_root, check_only=False):
                     "Units are explicit operator declarations, not inferred conversions",
                     "Integrity hashes are not signatures",
                 ],
+            )
+        if batch.summary.get("model_type") == "nn":
+            from ml_template.monitoring.nn_monitoring_contract import assessment_scope
+
+            summary.update(
+                model_type="nn",
+                nn_context=batch.summary["nn_context"],
+                assessment_scope=assessment_scope(
+                    config,
+                    performance,
+                    sampling,
+                    reference["n_rows"],
+                    len(batch.source),
+                    self_reference=reference["scoring_batch_id"] == batch.batch_id,
+                ),
             )
         write_json(directory / "config.json", config.model_dump(mode="json"))
         write_json(directory / "quality.json", quality)

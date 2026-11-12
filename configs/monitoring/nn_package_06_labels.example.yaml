@@ -1,0 +1,9 @@
+pipeline_dir: artifacts/nn_batch_pipelines/REPLACE_WITH_SUCCESSFUL_NNPIPE_DIRECTORY
+expected_pipeline_id: nnpipe_REPLACE_WITH_ACTUAL_ID
+expected_pipeline_manifest_sha256: REPLACE_WITH_ACTUAL_64_HEX_SHA256
+scoring_batch_id: score_REPLACE_WITH_ACTUAL_BATCH_ID
+target_unit: MPa
+input_path: data/labels/REPLACE_WITH_MEASURED_OUTCOMES.csv
+source: "REPLACE with actual measurement source"
+outcome_definition: "Measured compressive strength at the row's specified age, MPa"
+sampling: unknown

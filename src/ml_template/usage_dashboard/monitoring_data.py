@@ -77,13 +77,28 @@ def load_assessment(database, identity):
         if view["config"].get(name) != record[name]:
             raise ValueError(f"monitoring configuration/registry mismatch: {name}")
     if (
-        view["summary"].get("schema_version") != 1
+        view["summary"].get("schema_version") not in {1, 2}
         or not isinstance(view["drift"], list)
         or not isinstance(view["findings"], list)
     ):
         raise ValueError("invalid monitoring result schema")
     if view["performance"] is not None and not isinstance(view["performance"], dict):
         raise ValueError("invalid labelled-performance result")
+    if view["summary"]["schema_version"] == 2:
+        summary = view["summary"]
+        if (
+            summary.get("task") != "regression"
+            or summary.get("prediction_kind") != "continuous"
+            or not summary.get("target_unit")
+        ):
+            raise ValueError("Invalid frozen regression monitoring semantics")
+        if view["performance"] is not None and view["performance"].get("task") != "regression":
+            raise ValueError("Wrong monitoring performance task")
+    elif view["summary"].get("task", "binary_classification") != "binary_classification":
+        raise ValueError("Wrong legacy monitoring task")
+    from ml_template.monitoring.nn_monitoring_contract import validate_frozen_view
+
+    validate_frozen_view(view)
     return view
 
 
@@ -120,6 +135,32 @@ def comparable_history(database, selected, *, limit=200):
             seen.add(batch)
             view = load_assessment(database, record["monitoring_id"])
             perf = view["performance"] or {}
+            summary = view["summary"]
+            if summary.get("task", "binary_classification") != selected.get(
+                "task", "binary_classification"
+            ):
+                continue
+            if summary.get("task") == "regression":
+                if summary.get("target_unit") != selected.get("target_unit"):
+                    continue
+                metrics = perf.get("score_metrics", {}).get("y_pred_release", {})
+                rows.append(
+                    {
+                        "monitoring_id": record["monitoring_id"],
+                        "scoring_batch_id": batch,
+                        "as_of": summary["as_of"],
+                        "task": "regression",
+                        "target_unit": summary["target_unit"],
+                        "rmse": metrics.get("rmse"),
+                        "mae": metrics.get("mae"),
+                        "bias": metrics.get("bias"),
+                        "r2": metrics.get("r2"),
+                        "coverage": perf.get("mature_label_coverage"),
+                        "n_evaluated": perf.get("n_evaluated"),
+                        "support": perf.get("sufficient_support"),
+                    }
+                )
+                continue
             metrics = perf.get("score_metrics", {}).get("p_release", {})
             rows.append(
                 {
@@ -140,6 +181,10 @@ def comparable_history(database, selected, *, limit=200):
 
 
 def metric_rows(perf):
+    if perf and perf.get("task") == "regression":
+        from ml_template.usage_dashboard.nn_monitor_report import metric_rows as regression_rows
+
+        return regression_rows(perf)
     if not perf:
         return []
     return [

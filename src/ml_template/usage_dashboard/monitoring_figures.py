@@ -22,6 +22,10 @@ def drift_figure(rows):
 
 
 def reliability_figure(perf):
+    if perf and perf.get("task") == "regression":
+        return empty(
+            "Probability reliability is not applicable to regression; see saved interval coverage metrics"
+        )
     if not perf or not perf.get("n_evaluated"):
         return empty("No mature labelled rows selected")
     fig = go.Figure(
@@ -49,6 +53,10 @@ def reliability_figure(perf):
 
 
 def history_figure(rows):
+    if rows and rows[0].get("task") == "regression":
+        from ml_template.usage_dashboard.nn_monitor_report import regression_history
+
+        return regression_history(rows)
     if not rows:
         return empty("No comparable assessment history")
     fig = go.Figure()

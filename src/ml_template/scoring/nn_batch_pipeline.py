@@ -143,16 +143,14 @@ def run_pipeline(request, *, check_only=True):
     ):
         raise ValueError("Output cannot be inside release/runtime source")
     if any(
-
-            (parent / name).is_file()
-            for parent in [output, *output.parents]
-            for name in [
-                "manifest.json",
-                "artifact_manifest.json",
-                "artifacts.json",
-                "release.json",
-            ]
-
+        (parent / name).is_file()
+        for parent in [output, *output.parents]
+        for name in [
+            "manifest.json",
+            "artifact_manifest.json",
+            "artifacts.json",
+            "release.json",
+        ]
     ):
         raise ValueError("Output cannot be inside sealed artifacts")
     ref = None

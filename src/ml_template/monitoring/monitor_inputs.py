@@ -114,6 +114,18 @@ def load_batch(engine, batch_id):
         from ml_template.monitoring.regression import validate_predictions
 
         validate_predictions(predictions, summary, info)
+        if info.get("model_type") == "nn":
+            from ml_template.monitoring.nn_monitoring_contract import release_binding
+
+            summary = release_binding(
+                summary,
+                info,
+                manifest,
+                record,
+                release_dir,
+                entries,
+                digest(directory / "artifacts.json"),
+            )
         predictions = predictions.set_index(key).loc[source[key]].reset_index()
         hashes = {name: item["sha256"] for name, item in entries.items()}
         hashes["artifacts.json"] = digest(directory / "artifacts.json")
