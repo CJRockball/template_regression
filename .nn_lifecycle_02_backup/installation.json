@@ -1,0 +1,18 @@
+{
+  "src/ml_template/training/regression_calibration.py": {
+    "before": "7c1930101774ed917706ebdfe492d9d4cb7054dc3c3222721ecb0b2405cb3337",
+    "after": "72cb6c5464af6ea08cde947670bb247ee28f4948f1c4e663cb3d15f334fb31be"
+  },
+  "tests/calibration/test_nn_lifecycle_02.py": {
+    "before": null,
+    "after": "53c9739f30811b2ae24378ea2bc5827d5ed38b75b77c7a009363ce61f613ab89"
+  },
+  "tests/calibration/test_nn_lifecycle_02_native.py": {
+    "before": null,
+    "after": "5083e86aa2b56730d1a4dc9246b116b3bbdcf389efb7e1baa9d3a5632c328c35"
+  },
+  "configs/calibration/concrete_nn_package_02.yaml": {
+    "before": null,
+    "after": "db49950793db8405c5f0719b12bf9d196f0033887f705a68eb5cdccbd279a346"
+  }
+}

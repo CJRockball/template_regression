@@ -1,0 +1,11 @@
+{
+  "README.md": "14597a4bfc4bdf376019e68518cd6f853bf705869adaf844e56f7a0bcbf24d0a",
+  "VALIDATION.json": "dbbecae3faf043bb1dc8062e10e5934679406c973455f04d7829831b3450e8c9",
+  "nn_lifecycle_02.patch": "a3516478eaa99d219b9a6d1f523a42f9412c792a558e26166609efa4c731829a",
+  "manifest.json": "0d87c589d176be63bddd27521522b5a2e1df45e7b39822b3ed6429f23d9363bf",
+  "install_nn_lifecycle_02.py": "33250228cdda2dc79b68eca452706f36032fec1d138991d29e42429cb54af689",
+  "payload/tests/calibration/test_nn_lifecycle_02.py": "53c9739f30811b2ae24378ea2bc5827d5ed38b75b77c7a009363ce61f613ab89",
+  "payload/tests/calibration/test_nn_lifecycle_02_native.py": "5083e86aa2b56730d1a4dc9246b116b3bbdcf389efb7e1baa9d3a5632c328c35",
+  "payload/src/ml_template/training/regression_calibration.py": "72cb6c5464af6ea08cde947670bb247ee28f4948f1c4e663cb3d15f334fb31be",
+  "payload/configs/calibration/concrete_nn_package_02.yaml": "db49950793db8405c5f0719b12bf9d196f0033887f705a68eb5cdccbd279a346"
+}

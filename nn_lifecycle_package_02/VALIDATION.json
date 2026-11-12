@@ -1,0 +1,45 @@
+{
+  "package": "nn_lifecycle_02",
+  "base_branch": "feature/update_nn",
+  "base_commit": "bfdf2370f440a5bc134127ae8f730d8708da2113",
+  "executed": {
+    "pure_pytest_cases": 49,
+    "pure_scope": "actual modified module and byte-verified unchanged maths in isolated package",
+    "isolated_sqlite_scenarios": 6,
+    "workflow_stubbed_boundaries": [
+      "metadata preparation",
+      "prediction",
+      "partition reader",
+      "artifact helper"
+    ],
+    "syntax": "3.11 grammar + compile on Python 3.12.8",
+    "installer": "private dependency fixture; exact original source check/apply/idempotence/rollback/source rejection",
+    "git_patch": "full-context check/application"
+  },
+  "not_executed": [
+    "28 native NN CPU cases",
+    "old XGB native postprocessing/release suite",
+    "full repository suite",
+    "Ruff",
+    "real saved-run fitting",
+    "CUDA",
+    "native Python 3.11"
+  ],
+  "unavailable_dependencies": [
+    "torch",
+    "pyarrow",
+    "sqlalchemy"
+  ],
+  "scope": {
+    "model_fitting": false,
+    "gold_fitting": false,
+    "development_labels_for_fit": false,
+    "holdout_labels_for_fit": false,
+    "reserved_labels_on_execute": true,
+    "registry_writes_on_execute": true,
+    "evaluation_enabled": false,
+    "release_enabled": false,
+    "parent_modified": false
+  },
+  "source_guard": "exact byte hashes, no AST fingerprints"
+}

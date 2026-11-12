@@ -1,0 +1,581 @@
+diff --git a/src/ml_template/training/regression_calibration.py b/src/ml_template/training/regression_calibration.py
+--- a/src/ml_template/training/regression_calibration.py
++++ b/src/ml_template/training/regression_calibration.py
+@@ -6,9 +6,10 @@
+ import uuid
+ from datetime import UTC, datetime
+ from pathlib import Path
++from typing import Literal
+ 
+ import yaml
+-from pydantic import BaseModel, ConfigDict, Field, model_validator
++from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+ 
+ from ml_template.models.regression_postprocessing import (
+     correct,
+@@ -24,6 +25,7 @@
+ class CalibrationConfig(BaseModel):
+     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+     parent_run_id: str = Field(min_length=1)
++    model_type: Literal["xgb", "nn"] = "xgb"
+     predictor_kind: str = "final"
+     correction: str = "none"
+     coverages: tuple[float, ...] = (0.8, 0.9, 0.95)
+@@ -33,6 +35,13 @@
+     intended_use: str = Field(min_length=1)
+     acknowledge_prior_exposure: bool = False
+     prior_exposure_note: str = ""
++
++    @model_serializer(mode="wrap")
++    def _legacy_serialization(self, handler):
++        result = handler(self)
++        if self.model_type == "xgb":
++            result.pop("model_type", None)
++        return result
+ 
+     @model_validator(mode="after")
+     def check(self):
+@@ -158,40 +167,75 @@
+     }
+ 
+ 
+-def calibrate(engine, config, *, output_root=None, check_only=True):
+-    from ml_template.db.evaluation_registry import connection
+-    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++def _prepare_calibration_inputs(engine, config, spec, roots):
++    if getattr(config, "model_type", "xgb") == "nn":
++        from ml_template.evaluation.regression_inputs import prepare_nn_regression_predictor_inputs
++        prepared = prepare_nn_regression_predictor_inputs(engine, spec, **roots)
++        if prepared.purpose != "predictor_only":
++            raise ValueError("NN calibration requires verified predictor-only preparation")
++        return prepared
+     from ml_template.evaluation.regression_inputs import prepare_regression
+-    from ml_template.features.prepared_recipe import load_partition, verify_prepared
+-    from ml_template.models.predictor_selection import load_evaluation_predictor
+-    from ml_template.monitoring.artifacts import seal, write_json
+-
+-    spec = RegressionEvaluationConfig(
+-        parent_run_id=config.parent_run_id, predictor={"kind": config.predictor_kind}
+-    )
+-    prepared = prepare_regression(engine, spec)
+-    silver_id = prepared.run_cfg.data.silver_dataset_version_id
+-    prior = prior_exposures(engine, silver_id)
++    return prepare_regression(engine, spec, **roots)
++
++
++def _role_inventory(prepared):
++    a, key = prepared.assignments, prepared.key_col
++    if (a.columns.duplicated().any() or not {key, "partition"} <= set(a)
++            or a[key].isna().any() or a[key].duplicated().any()
++            or not a.partition.isin(["dev", "holdout", "calibration", "recalibration"]).all()):
++        raise ValueError("Invalid or overlapping reserved-role key inventory")
++    return {role: a.loc[a.partition.eq(role), key].tolist()
++            for role in ("dev", "holdout", "calibration", "recalibration")}
++
++
++def calibration_roles(prepared, config):
++    inventory = _role_inventory(prepared)
+     roles = {}
+     for role, required, minimum in (
+         ("calibration", bool(config.coverages), config.min_calibration_rows),
+         ("recalibration", config.correction != "none", config.min_recalibration_rows),
+     ):
+-        keys = prepared.assignments.loc[
+-            prepared.assignments.partition.eq(role), prepared.key_col
+-        ].tolist()
++        keys = inventory[role]
+         if required and len(keys) < minimum:
+-            raise ValueError(
+-                "reserve sufficient "
+-                + role
+-                + " rows BEFORE training; old dev/holdout rows are ineligible"
+-            )
++            raise ValueError("reserve sufficient " + role + " rows BEFORE training; old dev/holdout rows are ineligible")
+         roles[role] = keys if required else []
+-    if set(roles["calibration"]) & set(roles["recalibration"]):
+-        raise ValueError("calibration roles overlap")
+     for coverage in config.coverages:
+         if rank_for(len(roles["calibration"]), coverage) > len(roles["calibration"]):
+             raise ValueError("sample too small for a finite requested interval")
++    return roles
++
++
++def _load_reserved_partition(prepared, role, keys):
++    if role not in {"calibration", "recalibration"}:
++        raise ValueError("Only reserved calibration roles may be loaded")
++    keys = list(keys)
++    inventory = _role_inventory(prepared)
++    if not keys or len(keys) != len(set(keys)) or set(keys) != set(inventory[role]):
++        raise ValueError("Requested keys must match exactly the declared reserved role")
++    if set(keys) & (set(inventory["dev"]) | set(inventory["holdout"])):
++        raise ValueError("Development/holdout keys are forbidden for postprocessing fitting")
++    from ml_template.features.prepared_recipe import load_partition
++    return load_partition(prepared, keys)
++
++
++def calibrate(engine, config, *, output_root=None, check_only=True,
++              silver_root=None, split_root=None, feature_root=None):
++    from ml_template.db.evaluation_registry import connection
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    from ml_template.features.prepared_recipe import verify_prepared
++    from ml_template.models.predictor_selection import load_evaluation_predictor
++    from ml_template.monitoring.artifacts import seal, write_json
++
++    spec = RegressionEvaluationConfig(
++        parent_run_id=config.parent_run_id, predictor={"kind": config.predictor_kind}
++    )
++    roots = {name: value for name, value in {
++        "silver_root": silver_root, "split_root": split_root, "feature_root": feature_root
++    }.items() if value is not None}
++    prepared = _prepare_calibration_inputs(engine, config, spec, roots)
++    silver_id = prepared.run_cfg.data.silver_dataset_version_id
++    prior = prior_exposures(engine, silver_id)
++    roles = calibration_roles(prepared, config)
+     report = {
+         "ready": not prior or config.acknowledge_prior_exposure,
+         "parent_run_id": config.parent_run_id,
+@@ -202,6 +246,10 @@
+         "calibration_labels_loaded": False,
+         "files_written": False,
+     }
++    if getattr(config, "model_type", "xgb") == "nn":
++        report.update(model_type="nn", scope="postprocessing_only", models_loaded=False,
++                      predictions_computed=False, recalibration_labels_loaded=False,
++                      evaluation_enabled=False, release_enabled=False)
+     if check_only:
+         return report
+     if not report["ready"]:
+@@ -272,11 +320,11 @@
+         model = load_evaluation_predictor(prepared)
+         correction = {"method": "none", "slope": 1.0, "intercept": 0.0}
+         if roles["recalibration"]:
+-            X, y = load_partition(prepared, roles["recalibration"])
++            X, y = _load_reserved_partition(prepared, "recalibration", roles["recalibration"])
+             correction = fit_correction(model.predict(X), y.to_numpy(float), config.correction)
+         quantiles = {}
+         if roles["calibration"]:
+-            X, y = load_partition(prepared, roles["calibration"])
++            X, y = _load_reserved_partition(prepared, "calibration", roles["calibration"])
+             quantiles = fit_quantiles(
+                 correct(model.predict(X), correction), y.to_numpy(float), config.coverages
+             )
+@@ -288,7 +336,7 @@
+         }
+         validate_parameters(parameters)
+         verify_prepared(prepared)
+-        fresh = prepare_regression(engine, spec)
++        fresh = _prepare_calibration_inputs(engine, config, spec, roots)
+         if prediction_binding(fresh.provenance) != prediction_binding(prepared.provenance):
+             raise ValueError("calibration inputs changed during fitting")
+         state = {
+@@ -328,6 +376,10 @@
+         "status": "succeeded",
+         "calibration_labels_loaded": bool(roles["calibration"] or roles["recalibration"]),
+         "files_written": True,
++        **({"models_loaded": True, "predictions_computed": True,
++            "calibration_labels_loaded": bool(roles["calibration"]),
++            "recalibration_labels_loaded": bool(roles["recalibration"])}
++           if getattr(config, "model_type", "xgb") == "nn" else {}),
+     }
+ 
+ 
+@@ -335,6 +387,7 @@
+     parser = argparse.ArgumentParser(description=__doc__)
+     parser.add_argument("--config", required=True, type=Path)
+     parser.add_argument("--output-root", type=Path)
++    parser.add_argument("--database", type=Path)
+     mode = parser.add_mutually_exclusive_group(required=True)
+     mode.add_argument("--check", action="store_true")
+     mode.add_argument("--execute", action="store_true")
+@@ -357,15 +410,26 @@
+     config = CalibrationConfig.model_validate(
+         yaml.load(args.config.read_text(), Loader=UniqueLoader)
+     )
+-    from ml_template.db.connection import get_engine
+-
+-    print(
+-        json.dumps(
+-            calibrate(get_engine(), config, output_root=args.output_root, check_only=args.check),
+-            indent=2,
+-            allow_nan=False,
+-        )
+-    )
++    owned = config.model_type == "nn" or args.database is not None
++    if owned:
++        import sqlite3
++        from sqlalchemy import create_engine
++        from ml_template.paths import DATABASE
++        database = (args.database if args.database is not None else DATABASE).expanduser().resolve()
++        if not database.is_file():
++            raise FileNotFoundError(database)
++        mode = "ro" if args.check else "rw"
++        engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(
++            database.as_uri() + "?mode=" + mode, uri=True))
++    else:
++        from ml_template.db.connection import get_engine
++        engine = get_engine()
++    try:
++        print(json.dumps(calibrate(engine, config, output_root=args.output_root,
++                                   check_only=args.check), indent=2, allow_nan=False))
++    finally:
++        if owned:
++            engine.dispose()
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/calibration/test_nn_lifecycle_02.py b/tests/calibration/test_nn_lifecycle_02.py
+new file mode 100644
+--- /dev/null
++++ b/tests/calibration/test_nn_lifecycle_02.py
+@@ -0,0 +1,151 @@
++"""Torch-free calibration request, role boundary and shared mathematical tests."""
++import copy
++import json
++from types import SimpleNamespace
++
++import numpy as np
++import pandas as pd
++import pytest
++
++from ml_template.models.regression_postprocessing import apply, correct, fit_correction, fit_quantiles, rank_for
++from ml_template.training.regression_calibration import (
++    CalibrationConfig, _load_reserved_partition, calibration_roles, fingerprint, prediction_binding,
++)
++
++
++def config(**extra):
++    return CalibrationConfig(**{"model_type": "nn", "parent_run_id": "run_test", "target_unit": "MPa",
++        "intended_use": "Synthetic test", "min_calibration_rows": 20, "min_recalibration_rows": 3, **extra})
++
++
++def prepared():
++    a = pd.DataFrame({"id": range(55), "partition": ["dev"] * 20 + ["holdout"] * 5 + ["calibration"] * 20 + ["recalibration"] * 10})
++    return SimpleNamespace(assignments=a, key_col="id")
++
++
++def test_xgb_default_serialization_unchanged():
++    cfg = CalibrationConfig(parent_run_id="run_test", target_unit="MPa", intended_use="Synthetic test")
++    expected = {"parent_run_id": "run_test", "predictor_kind": "final", "correction": "none",
++                "coverages": [.8, .9, .95], "target_unit": "MPa", "min_calibration_rows": 30,
++                "min_recalibration_rows": 10, "intended_use": "Synthetic test",
++                "acknowledge_prior_exposure": False, "prior_exposure_note": ""}
++    assert cfg.model_type == "xgb"
++    assert json.loads(cfg.model_dump_json()) == expected
++    assert fingerprint(cfg.model_dump(mode="json")) == fingerprint(expected)
++
++
++def test_nn_model_type_is_explicit_in_artifact_request():
++    assert config().model_dump(mode="json")["model_type"] == "nn"
++    assert CalibrationConfig.model_validate_json(config().model_dump_json()) == config()
++
++
++@pytest.mark.parametrize("extra", [{"model_type": "torch"}, {"predictor_kind": "auto"},
++    {"correction": "isotonic"}, {"coverages": [.9, .8]}, {"coverages": [.8, .8]},
++    {"coverages": [1.]}, {"coverages": [-.1]}, {"coverages": [.1234567]},
++    {"coverages": [], "correction": "none"}, {"target_unit": " "},
++    {"intended_use": " "}, {"acknowledge_prior_exposure": True, "prior_exposure_note": ""},
++    {"calibration_partition": "dev"}])
++def test_invalid_requests(extra):
++    with pytest.raises(ValueError):
++        config(**extra)
++
++
++@pytest.mark.parametrize("method", ["none", "bias", "affine"])
++def test_only_required_roles_selected(method):
++    p = prepared(); roles = calibration_roles(p, config(correction=method))
++    assert roles["calibration"] == list(range(25, 45))
++    assert roles["recalibration"] == ([] if method == "none" else list(range(45, 55)))
++    assert not (set(roles["calibration"]) | set(roles["recalibration"])) & set(range(25))
++
++
++def test_correction_only_does_not_use_interval_calibration():
++    roles = calibration_roles(prepared(), config(correction="bias", coverages=[]))
++    assert roles["calibration"] == [] and roles["recalibration"] == list(range(45, 55))
++
++
++@pytest.mark.parametrize("role", ["calibration", "recalibration"])
++def test_missing_reserved_population_rejected(role):
++    p = prepared(); p.assignments.loc[p.assignments.partition.eq(role), "partition"] = "dev"
++    with pytest.raises(ValueError, match="BEFORE training"):
++        calibration_roles(p, config(correction="bias"))
++
++
++def test_no_finite_interval_for_undersized_population():
++    with pytest.raises(ValueError, match="finite requested interval"):
++        calibration_roles(prepared(), config(coverages=[.99]))
++
++
++@pytest.mark.parametrize("kind", ["duplicate", "missing", "unknown_role"])
++def test_malformed_population(kind):
++    p = prepared()
++    if kind == "duplicate":
++        p.assignments.loc[25, "id"] = 0
++    elif kind == "missing":
++        p.assignments.loc[25, "id"] = np.nan
++    else:
++        p.assignments.loc[25, "partition"] = "other"
++    with pytest.raises(ValueError):
++        calibration_roles(p, config(correction="bias"))
++
++
++@pytest.mark.parametrize("role,keys", [("dev", [0]), ("holdout", [20]), ("other", [0]),
++    ("calibration", []), ("calibration", [25, 25]), ("calibration", list(range(26, 45))),
++    ("calibration", list(range(20))), ("recalibration", list(range(25, 45)))])
++def test_invalid_loads_blocked_before_partition_loader(role, keys):
++    with pytest.raises(ValueError):
++        _load_reserved_partition(prepared(), role, keys)
++
++
++@pytest.mark.parametrize("method,slope,intercept", [("none", 1., 0.), ("bias", 1., 3.), ("affine", 2., 3.)])
++def test_known_corrections(method, slope, intercept):
++    p = np.array([-2., -.5, 1., 3.])
++    y = p if method == "none" else (p + 3 if method == "bias" else 2 * p + 3)
++    fitted = fit_correction(p, y, method)
++    assert fitted["slope"] == pytest.approx(slope)
++    assert fitted["intercept"] == pytest.approx(intercept)
++    np.testing.assert_allclose(correct(p, fitted), y)
++
++
++def test_constant_predictor_affine_rejected():
++    with pytest.raises(ValueError, match="varying predictions"):
++        fit_correction([1., 1., 1.], [2., 3., 4.], "affine")
++
++
++def test_bias_then_independent_quantile_and_apply():
++    correction = fit_correction([0., 1., 2.], [3., 4., 5.], "bias")
++    prediction = np.zeros(9)
++    target = np.arange(9.) + 3
++    quantiles = fit_quantiles(correct(prediction, correction), target, [.5, .8])
++    assert quantiles["c500000"]["rank"] == 5 and quantiles["c500000"]["half_width"] == 4
++    assert quantiles["c800000"]["rank"] == 8 and quantiles["c800000"]["half_width"] == 7
++    state = {"schema_version": 1, "correction": correction, "n_calibration": 9, "quantiles": quantiles}
++    point, bounds = apply([-1., 2.], state, [.8])
++    np.testing.assert_allclose(point, [2., 5.])
++    np.testing.assert_allclose(bounds["pi_lower_c800000"], point - 7)
++    np.testing.assert_allclose(bounds["pi_upper_c800000"], point + 7)
++
++
++@pytest.mark.parametrize("n,coverage,rank", [(19, .95, 19), (20, .95, 20), (8, .8, 8), (8, .95, 9)])
++def test_finite_sample_rank(n, coverage, rank):
++    assert rank_for(n, coverage) == rank
++
++
++def provenance():
++    return {"predictor": {"model_type": "nn", "kind": "final"}, "input_hashes": {"model.ubj": "a"},
++        "feature_preparation": {"feature_set_id": None}, "versions": {"torch": "test"}, "python": "test",
++        "code_hashes": {"models/nn_regression_predictor.py": "a", "evaluation/regression_inputs.py": "b", "dashboard/app.py": "c"}}
++
++
++@pytest.mark.parametrize("field", ["predictor", "input_hashes", "feature_preparation", "versions", "python", "code_hashes"])
++def test_binding_changes_with_critical_evidence(field):
++    p = provenance(); changed = copy.deepcopy(p)
++    if field == "code_hashes":
++        changed[field]["models/nn_regression_predictor.py"] = "new"
++    else:
++        changed[field] = {"changed": True} if field != "python" else "new"
++    assert fingerprint(prediction_binding(changed)) != fingerprint(prediction_binding(p))
++
++
++def test_dashboard_only_code_not_prediction_binding():
++    p = provenance(); changed = copy.deepcopy(p); changed["code_hashes"]["dashboard/app.py"] = "new"
++    assert prediction_binding(changed) == prediction_binding(p)
+diff --git a/tests/calibration/test_nn_lifecycle_02_native.py b/tests/calibration/test_nn_lifecycle_02_native.py
+new file mode 100644
+--- /dev/null
++++ b/tests/calibration/test_nn_lifecycle_02_native.py
+@@ -0,0 +1,175 @@
++"""Real synthetic CPU NN calibration. Reuses the accepted Package 01 training fixture."""
++import importlib.util
++import json
++import sys
++from pathlib import Path
++
++import numpy as np
++import pandas as pd
++import pytest
++
++_fixture_path = Path(__file__).parents[1] / "models" / "test_nn_lifecycle_01_native.py"
++_fixture_spec = importlib.util.spec_from_file_location("nn_package_02_training_fixture", _fixture_path)
++_fixture_module = importlib.util.module_from_spec(_fixture_spec)
++sys.modules[_fixture_spec.name] = _fixture_module
++_fixture_spec.loader.exec_module(_fixture_module)
++trained = _fixture_module.trained
++
++
++def request_for(trained, **extra):
++    from ml_template.training.regression_calibration import CalibrationConfig
++    return CalibrationConfig(**{"model_type": "nn", "parent_run_id": trained["rid"],
++        "predictor_kind": "final", "correction": "none", "coverages": [.5, .8],
++        "target_unit": "synthetic_units", "min_calibration_rows": 5, "min_recalibration_rows": 3,
++        "intended_use": "Synthetic acceptance only", **extra})
++
++
++def prepare(trained, kind):
++    return _fixture_module.prepare(trained, kind)
++
++
++def in_memory_role(prepared, trained, role):
++    from ml_template.features.prepared_recipe import prepare_frame
++    plan = prepared.provenance["feature_preparation"]
++    keys = trained["assignment"].loc[trained["assignment"].partition.eq(role), "id"].tolist()
++    frame = trained["df"].set_index("id").loc[keys]
++    X = prepare_frame(frame[plan["recipe"]["raw_columns"]], plan["recipe"], plan["model_schema"])
++    return X, frame.y.to_numpy(float)
++
++
++@pytest.mark.parametrize("predictor_kind", ["final", "cv_mean"])
++@pytest.mark.parametrize("variant", ["intervals", "bias_intervals", "affine_intervals", "bias_only", "affine_only"])
++def test_real_nn_reserved_postprocessing(trained, tmp_path, monkeypatch, predictor_kind, variant):
++    from ml_template.models.nn_regressor import NNRegressionAdapter
++    from ml_template.models.predictor_selection import load_evaluation_predictor
++    from ml_template.models.regression_postprocessing import apply, correct, fit_correction, fit_quantiles
++    from ml_template.preprocessing.nn_preprocessor import NNPreprocessor
++    from ml_template.training import regression_calibration as calibration
++    method = "none" if variant == "intervals" else variant.split("_")[0]
++    coverages = [] if variant.endswith("_only") else [.5, .8]
++    config = request_for(trained, predictor_kind=predictor_kind, correction=method, coverages=coverages)
++    inventory = {role: set(trained["assignment"].loc[trained["assignment"].partition.eq(role), "id"])
++                 for role in ("dev", "holdout", "calibration", "recalibration")}
++    phase = {"value": "check"}; seen = []
++    original_read = pd.read_parquet
++    def spy(path, *args, **kwargs):
++        if Path(path) == trained["parquet"]:
++            assert phase["value"] == "fit", "preflight read source values"
++            assert "y" in kwargs.get("columns", [])
++            keys = set(kwargs["filters"][0][2])
++            assert not keys & (inventory["dev"] | inventory["holdout"])
++            role = next((name for name in ("calibration", "recalibration") if keys == inventory[name]), None)
++            assert role is not None, "read crossed reserved-role boundary"
++            seen.append(role)
++        return original_read(path, *args, **kwargs)
++    monkeypatch.setattr(pd, "read_parquet", spy)
++    monkeypatch.setattr(NNPreprocessor, "fit", lambda *a, **k: pytest.fail("calibration fitted Gold"))
++    monkeypatch.setattr(NNRegressionAdapter, "_train", lambda *a, **k: pytest.fail("calibration trained NN"))
++    old_load = trained["torch"].load
++    monkeypatch.setattr(trained["torch"], "load", lambda *a, **k: pytest.fail("preflight loaded checkpoint"))
++    output = tmp_path / "nn_calibrations"
++    database = tmp_path / "project.db"
++    before = trained["sha256"](database)
++    checked = calibration.calibrate(trained["engine"], config, check_only=True,
++                                   output_root=output, **trained["roots"])
++    assert checked["ready"] and not checked["models_loaded"] and not checked["predictions_computed"]
++    assert not checked["calibration_labels_loaded"] and not checked["recalibration_labels_loaded"]
++    assert not seen and not output.exists() and before == trained["sha256"](database)
++    monkeypatch.setattr(trained["torch"], "load", old_load)
++    phase["value"] = "fit"
++    result = calibration.calibrate(trained["engine"], config, check_only=False,
++                                  output_root=output, **trained["roots"])
++    expected_reads = (["recalibration"] if method != "none" else []) + (["calibration"] if coverages else [])
++    assert seen == expected_reads
++    assert result["status"] == "succeeded" and not result["holdout_labels_loaded"]
++    assert result["models_loaded"] and result["predictions_computed"]
++    assert not result["evaluation_enabled"] and not result["release_enabled"]
++    phase["value"] = "binding"
++    prepared = prepare(trained, predictor_kind)
++    artifact = calibration.load_calibration(trained["engine"], result["calibration_id"], trained["rid"],
++                                            prepared.provenance, config.target_unit)
++    parameters = artifact["state"]["parameters"]
++    assert artifact["state"]["config"]["model_type"] == "nn"
++    assert parameters["n_calibration"] == (len(inventory["calibration"]) if coverages else 0)
++    predictor = load_evaluation_predictor(prepared)
++    expected_correction = {"method": "none", "slope": 1., "intercept": 0.}
++    if method != "none":
++        X, y = in_memory_role(prepared, trained, "recalibration")
++        expected_correction = fit_correction(predictor.predict(X), y, method)
++    assert parameters["correction"]["slope"] == pytest.approx(expected_correction["slope"])
++    assert parameters["correction"]["intercept"] == pytest.approx(expected_correction["intercept"])
++    if coverages:
++        X, y = in_memory_role(prepared, trained, "calibration")
++        expected_quantiles = fit_quantiles(correct(predictor.predict(X), expected_correction), y, coverages)
++        for tag, item in expected_quantiles.items():
++            assert parameters["quantiles"][tag]["rank"] == item["rank"]
++            assert parameters["quantiles"][tag]["half_width"] == pytest.approx(item["half_width"])
++    else:
++        assert parameters["quantiles"] == {}
++    X, _ = in_memory_role(prepared, trained, "calibration")
++    raw = predictor.predict(X)
++    point, bounds = apply(raw, parameters, coverages)
++    np.testing.assert_allclose(point, correct(raw, expected_correction), atol=1e-6, rtol=0)
++    for tag in parameters["quantiles"]:
++        np.testing.assert_allclose((bounds["pi_lower_" + tag] + bounds["pi_upper_" + tag]) / 2, point, atol=1e-6, rtol=0)
++    # A final calibration cannot be rebound to CV-mean, or vice versa.
++    other = prepare(trained, "cv_mean" if predictor_kind == "final" else "final")
++    with pytest.raises(ValueError, match="binding differs"):
++        calibration.load_calibration(trained["engine"], result["calibration_id"], trained["rid"], other.provenance, config.target_unit)
++    with pytest.raises(ValueError, match="binding differs"):
++        calibration.load_calibration(trained["engine"], result["calibration_id"], trained["rid"], prepared.provenance, "wrong_units")
++    from ml_template.evaluation.regression_inputs import prepare_regression
++    from ml_template.evaluation.regression_config import RegressionEvaluationConfig
++    with pytest.raises(ValueError, match="Expected XGB"):
++        prepare_regression(trained["engine"], RegressionEvaluationConfig(parent_run_id=trained["rid"]), **trained["roots"])
++    # New calibration evidence is immutable after completion.
++    state_path = Path(artifact["artifact_dir"]) / "calibration.json"
++    state_path.write_text(state_path.read_text() + " ")
++    with pytest.raises(ValueError):
++        calibration.load_calibration(trained["engine"], result["calibration_id"], trained["rid"], prepared.provenance, config.target_unit)
++
++
++@pytest.mark.parametrize("case", ["minimum", "finite_rank"])
++def test_support_failure_has_no_reads_or_outputs(trained, tmp_path, monkeypatch, case):
++    from ml_template.training import regression_calibration as calibration
++    original_read = pd.read_parquet
++    def spy(path, *args, **kwargs):
++        if Path(path) == trained["parquet"]:
++            pytest.fail("support failure read source values")
++        return original_read(path, *args, **kwargs)
++    monkeypatch.setattr(pd, "read_parquet", spy)
++    monkeypatch.setattr(trained["torch"], "load", lambda *a, **k: pytest.fail("support failure loaded model"))
++    extra = {"min_calibration_rows": 100} if case == "minimum" else {"coverages": [.95]}
++    config = request_for(trained, **extra)
++    output = tmp_path / "no_output"
++    with pytest.raises(ValueError):
++        calibration.calibrate(trained["engine"], config, output_root=output, **trained["roots"])
++    assert not output.exists()
++
++
++def test_prior_exposure_requires_acknowledgement(trained, tmp_path, monkeypatch):
++    from ml_template.training import regression_calibration as calibration
++    monkeypatch.setattr(calibration, "prior_exposures", lambda *a: [{"evaluation_id": "synthetic_prior", "accessed_at": "synthetic"}])
++    checked = calibration.calibrate(trained["engine"], request_for(trained), **trained["roots"])
++    assert not checked["ready"]
++    output = tmp_path / "no_output"
++    with pytest.raises(ValueError, match="explicit research acknowledgement"):
++        calibration.calibrate(trained["engine"], request_for(trained), check_only=False,
++                              output_root=output, **trained["roots"])
++    assert not output.exists()
++    request = request_for(trained, acknowledge_prior_exposure=True, prior_exposure_note="Synthetic history only")
++    assert calibration.calibrate(trained["engine"], request, **trained["roots"])["ready"]
++
++
++def test_failure_keeps_audit_and_releases_lock(trained, tmp_path, monkeypatch):
++    from ml_template.training import regression_calibration as calibration
++    from ml_template.db.evaluation_registry import query
++    def fail(*args, **kwargs):
++        raise RuntimeError("synthetic quantile failure")
++    monkeypatch.setattr(calibration, "fit_quantiles", fail)
++    with pytest.raises(RuntimeError, match="synthetic quantile failure"):
++        calibration.calibrate(trained["engine"], request_for(trained), check_only=False,
++                              output_root=tmp_path / "failed", **trained["roots"])
++    records = query(trained["engine"], "SELECT status,accessed_at FROM regression_calibrations")
++    assert len(records) == 1 and records[0]["status"] == "failed" and records[0]["accessed_at"] is not None
++    assert not query(trained["engine"], "SELECT * FROM final_evaluation_locks")
+diff --git a/configs/calibration/concrete_nn_package_02.yaml b/configs/calibration/concrete_nn_package_02.yaml
+new file mode 100644
+--- /dev/null
++++ b/configs/calibration/concrete_nn_package_02.yaml
+@@ -0,0 +1,15 @@
++# Package 02 only: freeze one NN postprocessing request BEFORE reserved-label access.
++# This is not an evaluation, release or parameter sweep.
++model_type: nn
++parent_run_id: run_20261111_135508_ccf0e8
++predictor_kind: final
++correction: none
++coverages: [0.8, 0.9, 0.95]
++target_unit: MPa
++min_calibration_rows: 30
++min_recalibration_rows: 10
++intended_use: "Exploratory NN regression interval calibration; no deployment approval"
++# Concrete has prior exposure: --check should report ready:false if history is present.
++# Deliberately not pre-authorised. Acknowledgement cannot restore independence.
++acknowledge_prior_exposure: false
++prior_exposure_note: ""
