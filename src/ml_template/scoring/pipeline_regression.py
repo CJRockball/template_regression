@@ -47,8 +47,12 @@ def verify_existing_evaluation(engine, run_id, evaluation_id, spec):
     from ml_template.scoring.regression_release import regression_evidence
 
     _prepared, directory, saved, summary, provenance = regression_evidence(
-        engine, SimpleNamespace(parent_run_id=run_id, evaluation_id=evaluation_id,
-                                calibration_id=getattr(spec, "calibration_id", None))
+        engine,
+        SimpleNamespace(
+            parent_run_id=run_id,
+            evaluation_id=evaluation_id,
+            calibration_id=getattr(spec, "calibration_id", None),
+        ),
     )
     if _normalised_spec(spec, saved) != saved:
         raise ValueError("Requested specification differs from the frozen evaluation")
@@ -189,7 +193,9 @@ def run_regression_pipeline(
     if not parent or parent["status"] != "succeeded":
         raise ValueError("run_id must identify a successful saved model")
     if parent.get("model_type") == "nn" and (release_dir is None or expected_evaluation_id is None):
-        raise ValueError("NN operational scoring requires an explicit existing release and evaluation; use the release-first YAML pipeline")
+        raise ValueError(
+            "NN operational scoring requires an explicit existing release and evaluation; use the release-first YAML pipeline"
+        )
     if (
         getattr(evaluation_spec, "task", None) != "regression"
         or evaluation_spec.parent_run_id != run_id

@@ -100,23 +100,19 @@ def validate_destination(p, root):
 
     root = Path(root).resolve()
     if any(
-
-            root.is_relative_to(Path(source).resolve())
-            for source in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()]
-
+        root.is_relative_to(Path(source).resolve())
+        for source in [p.run_dir, ARTIFACTS_RUNS, p.parquet_path.parent, *p.roots.values()]
     ):
         raise ValueError("NN release output cannot be inside source/run artifacts")
     if any(
-
-            (parent / name).is_file()
-            for parent in [root, *root.parents]
-            for name in [
-                "manifest.json",
-                "artifact_manifest.json",
-                "artifacts.json",
-                "release.json",
-            ]
-
+        (parent / name).is_file()
+        for parent in [root, *root.parents]
+        for name in [
+            "manifest.json",
+            "artifact_manifest.json",
+            "artifacts.json",
+            "release.json",
+        ]
     ):
         raise ValueError("NN release output cannot be inside sealed artifacts")
 

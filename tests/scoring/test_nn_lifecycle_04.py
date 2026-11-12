@@ -131,10 +131,7 @@ def parity():
 def test_keyed_shuffled_and_negative_parity():
     ref, whole, chunk, single, columns = parity()
     assert all(
-
-            v == 0
-            for v in compare_reference(ref, whole, chunk, single, "id", columns, 1e-06).values()
-
+        v == 0 for v in compare_reference(ref, whole, chunk, single, "id", columns, 1e-06).values()
     )
 
 
