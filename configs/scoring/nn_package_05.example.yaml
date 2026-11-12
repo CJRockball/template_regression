@@ -1,0 +1,23 @@
+# Existing sealed NN release only. No evaluation/release construction is performed.
+release_dir: artifacts/releases/rel_921a10f4d0ea8e165a66a902
+expected_release_id: rel_921a10f4d0ea8e165a66a902
+input_path: data/inference/concrete_demo.csv
+input_format: canonical
+# Package SOURCE directory, not repository root or src itself.
+runtime_source_root: /home/python_user/coding/ds/template_regression/src/ml_template
+# Preserve the venv executable path; do not replace it with its system symlink target.
+runtime_python: /home/python_user/coding/ds/template_regression/.venv/bin/python3
+database: data/project.db
+output_root: artifacts/nn_batch_pipelines
+chunk_size: 128
+timeout_s: 1800
+acknowledge_research_scoring: false
+batch_metadata:
+  source_system: nn_example_batch
+export:
+  reference: data/inference/concrete_demo_reference.csv
+  columns:
+    y_pred_release: prediction
+# Optional exports must be declared by that release; example for a calibrated 90% release:
+#    pi_lower_c900000: lower90
+#    pi_upper_c900000: upper90
