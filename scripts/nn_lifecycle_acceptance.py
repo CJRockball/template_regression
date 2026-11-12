@@ -107,10 +107,8 @@ def assess(events, phase, returncode):
     if not required <= events.keys():
         return ["pytest event evidence incomplete"] + issues
     if not isinstance(events["collected"], dict) or any(
-
-            not isinstance(events[k], list)
-            for k in ["passed", "skipped", "failed", "xfail", "deselected", "collection_errors"]
-
+        not isinstance(events[k], list)
+        for k in ["passed", "skipped", "failed", "xfail", "deselected", "collection_errors"]
     ):
         return ["pytest evidence has wrong types"] + issues
     if events["exitstatus"] != 0:

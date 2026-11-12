@@ -1,8 +1,0 @@
-{
-  "scripts/nn_acceptance_plugin.py": "5ec296de2d28cf5aed21f4be9fca0b2f3a29fd0c85b04456a7439b50d697e00f",
-  "scripts/nn_lifecycle_acceptance.py": "3e3bf80689b857dfc16425b1430cd0575b4a90b1793cb2e83dec1d87c4f24192",
-  "configs/acceptance/nn_package_07.json": "04a278263b35452ec7bdb8865ade9e3c471cfb0172b50b9767a92e73f23a81dd",
-  "tests/runtime/test_nn_lifecycle_07_acceptance.py": "40967cd4a03e47a1d69bac78b2c433372a7818d3641f8ad32af5c07bb19b1f67",
-  ".github/workflows/nn-lifecycle-acceptance.yml": "ac9bc61b65a55e7d7aac4c6216bad8db2949e9bb90854ad65fd79575021ffb8d",
-  "docs/nn_lifecycle_package_07.md": "55adfd75f99836db78bde29169212a66c6e37c895e5cef82ce1e5a787754925f"
-}
