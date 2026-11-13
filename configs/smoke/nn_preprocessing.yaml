@@ -1,6 +1,6 @@
-# Standalone preprocessing smoke schema, NOT an experiment or sweep schema.
-# Paths are relative to the repository root; run from that root.
-preprocessor: configs/preprocessing/nn_preprocessing_example.yaml
+# TEMPLATE ONLY: bind actual data/artifact IDs and declared units before use.
+# No measured outcomes, real release IDs or operator approvals are supplied.
+preprocessor: configs/preprocessing/nn.example.yaml
 source:
   kind: synthetic
   rows: 128

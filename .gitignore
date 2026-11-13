@@ -43,6 +43,7 @@ env/
 *.log
 logs/*
 !logs/.gitignore
+
 # --- Data policy (see data/README.md) ---
 # Raw SECOM files: regenerable via fetch, never commit.
 # Ignore everything under data except the raw placeholder.
@@ -50,16 +51,29 @@ logs/*
 !/data/raw/
 /data/raw/*
 !/data/raw/.gitignore
-# Don't commit all the training configs
-/configs/experiment/*
-!/configs/experiment/.gitignore
+
+# --- Config policy ---
+# Config templates: ignore local requests, retain reviewed examples and infrastructure.
+/configs/**
+!/configs/**/
+!/configs/**/README.md
+!/configs/**/.gitignore
+!/configs/**/*.example.yaml
+!/configs/**/*.example.yml
+!/configs/**/*.fragment.yaml
+!/configs/acceptance/**
+!/configs/bronze_silver_contract.yaml
 !/configs/experiment/xgb_baseline.yaml
-/configs/features/*
-!/configs/features/.gitignore
-/configs/sweep/*
-!/configs/sweep/.gitignore
-!/configs/ai4i_binary.yaml
+!/configs/explainability/example.yaml
+!/configs/model/nn_mlp.yaml
+!/configs/model/xgb.yaml
+!/configs/preprocessing/nn_preprocessing_example.yaml
+!/configs/smoke/nn_preprocessing.yaml
+!/configs/smoke/nn_training.yaml
+!/configs/smoke/nn_training_development.yaml
 !/configs/sweep/xgb_grid.yaml
+
+
 # --- Don't upload unnecessary files ---
 # Notebooks
 notebooks/*
@@ -72,12 +86,11 @@ artifacts/*
 *:Zone.Identifier
 
 # Scrap file
-/.policy_update_backups
-/.scoring_patch_backup
 /work_record.md
 /experiment_record.md
 /todo.txt
 /scratch.py
+
 # SQLite DB is derived: rebuild via the ingest entry point.
 # NOTE: the pattern ".db" (previous version) matches only a file literally
 # named ".db" — it never ignored secom.db. The glob is required.

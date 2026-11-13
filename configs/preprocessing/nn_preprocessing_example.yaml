@@ -1,7 +1,10 @@
-# Dedicated preprocessing config: explicit feature-only columns after fitted FE.
-# Replace these example names with your actual resolved input columns.
-numeric: [measurement, delay]
-categorical: [category, rating]
+# TEMPLATE ONLY: bind actual data/artifact IDs and declared units before use.
+# No measured outcomes, real release IDs or operator approvals are supplied.
+# Dedicated preprocessing schema, not an experiment.
+numeric:
+- x1
+- x2
+categorical: []
 numeric_strategy: median
 scaling: standard
 constant_fill: 0.0
