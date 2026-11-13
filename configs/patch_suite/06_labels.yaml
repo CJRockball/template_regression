@@ -1,9 +1,0 @@
-# One row per scored key, including unknown outcomes. Set sampling:all_rows ONLY when that describes collection, not just file completeness.
-schema_version: 1
-scoring_batch_id: REPLACE_CURRENT_SCORING_BATCH_ID
-input_path: REPLACE_COMPLETE_KEYED_OUTCOME_SNAPSHOT.csv
-source: REPLACE_OUTCOME_SOURCE
-outcome_definition: REPLACE_OUTCOME_DEFINITION_AND_HORIZON
-sampling: unknown
-target_unit: REPLACE_TARGET_UNIT
-supersedes_label_import_id: null

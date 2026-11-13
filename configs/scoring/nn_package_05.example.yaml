@@ -1,23 +1,20 @@
-# Existing sealed NN release only. No evaluation/release construction is performed.
-release_dir: artifacts/releases/rel_921a10f4d0ea8e165a66a902
-expected_release_id: rel_921a10f4d0ea8e165a66a902
-input_path: data/inference/concrete_demo.csv
+# TEMPLATE ONLY: bind actual data/artifact IDs and declared units before use.
+# No measured outcomes, real release IDs or operator approvals are supplied.
+# Release-first only. Reference supplies keys/order, never outcomes. Use the original sealed runtime.
+release_dir: artifacts/releases/rel_REPLACE_WITH_ACTUAL_ID
+expected_release_id: rel_REPLACE_WITH_ACTUAL_ID
+input_path: data/inference/demo_features.csv
 input_format: canonical
-# Package SOURCE directory, not repository root or src itself.
-runtime_source_root: /home/python_user/coding/ds/template_regression/src/ml_template
-# Preserve the venv executable path; do not replace it with its system symlink target.
-runtime_python: /home/python_user/coding/ds/template_regression/.venv/bin/python3
+runtime_source_root: /REPLACE_WITH_PINNED_CHECKOUT/src/ml_template
+runtime_python: /REPLACE_WITH_PINNED_ENV/bin/python
 database: data/project.db
 output_root: artifacts/nn_batch_pipelines
 chunk_size: 128
 timeout_s: 1800
 acknowledge_research_scoring: false
 batch_metadata:
-  source_system: nn_example_batch
+  source_system: REPLACE_WITH_ACTUAL_SOURCE
 export:
-  reference: data/inference/concrete_demo_reference.csv
+  reference: data/inference/demo_reference_keys.csv
   columns:
     y_pred_release: prediction
-# Optional exports must be declared by that release; example for a calibrated 90% release:
-#    pi_lower_c900000: lower90
-#    pi_upper_c900000: upper90

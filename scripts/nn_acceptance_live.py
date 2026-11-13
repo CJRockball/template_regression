@@ -183,9 +183,7 @@ def run(
             raise ValueError("Full acceptance requires the unchanged approved Package 07 plan")
     output = core.validate_output(root, output)
     dependencies = (
-        core.REQUIRED
-        if full or any(p["name"] != "gate_selftest" for p in selected)
-        else ["pytest"]
+        core.REQUIRED if full or any(p["name"] != "gate_selftest" for p in selected) else ["pytest"]
     )
     missing = [n for n in dependencies if core.importlib.util.find_spec(n) is None]
     paths = [
@@ -382,10 +380,8 @@ def main(argv=None):
     mode.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     if any(
-
-            not math.isfinite(v) or v <= 0
-            for v in (args.phase_timeout_s, args.total_timeout_s, args.heartbeat_s)
-
+        not math.isfinite(v) or v <= 0
+        for v in (args.phase_timeout_s, args.total_timeout_s, args.heartbeat_s)
     ):
         parser.error("Budgets/heartbeat must be positive")
     previous = {}

@@ -27,6 +27,8 @@ def test_load_defaults_and_override(tmp_path):
     assert cfg.seed == 1
     assert cfg.schema_version == 2
     p = cfg.model.params
+    assert p.n_estimators == 2000
+    assert cfg.analysis.error_sample_size == 25
     assert (p.early_stopping_rounds, p.scale_pos_weight, p.device) == (50, "auto", "cpu")
     assert cfg.training.validation_fraction == 0.2
     assert cfg.analysis.permutation_importance and cfg.analysis.permutation_repeats == 10
@@ -158,10 +160,28 @@ def test_resolve_path_falls_back_to_repo_root(tmp_path, monkeypatch):
 
 def test_repository_configs_are_valid():
     cfg = rc.load_config(CONFIGS / "experiment" / "xgb_baseline.yaml")
+
+    assert cfg.task == "binary_classification"
+    assert cfg.model.type == "xgb"
+    assert cfg.model.params.objective == "binary:logistic"
     assert cfg.model.params.eval_metric == "aucpr"
-    assert cfg.model.params.n_estimators == 2000
-    assert cfg.analysis.error_sample_size == 25
-    assert len(rc.expand_sweep(CONFIGS / "sweep" / "xgb_grid.yaml")) == 12
+    assert cfg.split.method == "stratified"
+    assert cfg.metrics.primary == "pr_auc"
+
+    # Examples may choose an explicit budget rather than the schema default.
+    assert cfg.model.params.n_estimators > 0
+    assert (
+        0
+        < cfg.model.params.early_stopping_rounds
+        <= cfg.model.params.n_estimators
+    )
+    assert cfg.analysis.error_sample_size >= 0
+
+    sweep = rc.expand_sweep(CONFIGS / "sweep" / "xgb_grid.yaml")
+    assert len(sweep) == 12
+    assert len({rc.config_hash(item) for item in sweep}) == 12
+    assert all(item.task == "binary_classification" for item in sweep)
+    assert all(item.model.type == "xgb" for item in sweep)
 
 
 def test_cli_prints_hash(tmp_path, capsys):

@@ -1,115 +1,61 @@
-# Bronze dataset configuration and contract
+# TEMPLATE ONLY: bind actual data/artifact IDs and declared units before use.
+# No measured outcomes, real release IDs or operator approvals are supplied.
+# Compatibility ingestion filename. Illustrative rows:256, not supplied data; edit the contract for your source.
 project:
-  name: concrete_regression
-  description: Small dataset to predict compressive strength of concrete
-
+  name: demo_regression
+  description: Illustrative tabular template, not time-series forecasting
 data_paths:
   database: data/project.db
   raw_data: data/raw
   processed_data: data/processed
   artifacts: artifacts
   logs: logs
-
 data:
   adapter: None
-  source: data/raw/concrete.csv
+  source: data/raw/demo_regression.csv
   format: csv
   entity_id: id
-  target: "Concrete compressive strength(MPa, megapascals)"
+  target: target
   task: regression
-
-# Minimal technical & structural contract for Bronze ingestion
 bronze_source_contract:
-  rows: 1030
-  columns: 10
-  col_names:
-    - "id"
-    - "Cement (component 1)(kg in a m^3 mixture)"
-    - "Blast Furnace Slag (component 2)(kg in a m^3 mixture)"
-    - "Fly Ash (component 3)(kg in a m^3 mixture)"
-    - "Water  (component 4)(kg in a m^3 mixture)"
-    - "Superplasticizer (component 5)(kg in a m^3 mixture)"
-    - "Coarse Aggregate  (component 6)(kg in a m^3 mixture)"
-    - "Fine Aggregate (component 7)(kg in a m^3 mixture)"
-    - "Age (day)"
-    - "Concrete compressive strength(MPa, megapascals)"
-
-  # Semantic column role classification for column_registry
+  rows: 256
+  columns: 4
+  col_names: &id001
+  - id
+  - x1
+  - x2
+  - target
   roles:
-    id: ["id"]
+    id:
+    - id
     feature:
-      - "Cement (component 1)(kg in a m^3 mixture)"
-      - "Blast Furnace Slag (component 2)(kg in a m^3 mixture)"
-      - "Fly Ash (component 3)(kg in a m^3 mixture)"
-      - "Water  (component 4)(kg in a m^3 mixture)"
-      - "Superplasticizer (component 5)(kg in a m^3 mixture)"
-      - "Coarse Aggregate  (component 6)(kg in a m^3 mixture)"
-      - "Fine Aggregate (component 7)(kg in a m^3 mixture)"
-      - "Age (day)"
-    target: ["Concrete compressive strength(MPa, megapascals)"]
-
-# Business-level validation (enforced downstream in Silver / EDA)
+    - x1
+    - x2
+    target:
+    - target
 validation:
-  required_columns:
-    - "id"
-    - "Cement (component 1)(kg in a m^3 mixture)"
-    - "Blast Furnace Slag (component 2)(kg in a m^3 mixture)"
-    - "Fly Ash (component 3)(kg in a m^3 mixture)"
-    - "Water  (component 4)(kg in a m^3 mixture)"
-    - "Superplasticizer (component 5)(kg in a m^3 mixture)"
-    - "Coarse Aggregate  (component 6)(kg in a m^3 mixture)"
-    - "Fine Aggregate (component 7)(kg in a m^3 mixture)"
-    - "Age (day)"
-    - "Concrete compressive strength(MPa, megapascals)"
+  required_columns: *id001
   require_unique_entity_id: true
-  max_missing_rate: 0.1
-
-# silver contract from eda
+  max_missing_rate: 0.0
 silver_eda_contract:
   canonical_names:
-    "id": "id"
-    "Cement (component 1)(kg in a m^3 mixture)": "cement"
-    "Blast Furnace Slag (component 2)(kg in a m^3 mixture)": "blast_furnace_slag" 
-    "Fly Ash (component 3)(kg in a m^3 mixture)": "fly_ash"
-    "Water  (component 4)(kg in a m^3 mixture)": "water"
-    "Superplasticizer (component 5)(kg in a m^3 mixture)": "plasticizer"
-    "Coarse Aggregate  (component 6)(kg in a m^3 mixture)": "coarse_aggregate"
-    "Fine Aggregate (component 7)(kg in a m^3 mixture)": "fine_aggregate"
-    "Age (day)": "age"
-    "Concrete compressive strength(MPa, megapascals)": "strength" 
-
+    id: id
+    x1: x1
+    x2: x2
+    target: target
   canonical_dtypes:
     id: Int64
-    cement: float64
-    blast_furnace_slag: float64
-    fly_ash: float64
-    water: float64
-    plasticizer: float64
-    coarse_aggregate: float64
-    fine_aggregate: float64
-    age: int64
-    strength: float64
-
+    x1: float64
+    x2: float64
+    target: float64
   feature_types:
     numerical:
-      - cement
-      - blast_furnace_slag
-      - fly_ash
-      - water
-      - plasticizer
-      - coarse_aggregate
-      - fine_aggregate
-      - age
-
+    - x1
+    - x2
     nominal: []
-
     ordinal: []
-
   allowed_values: {}
-
-
   value_mappings: {}
-
   missingness:
     default_max_rate: 0.0
     max_rate_by_column: {}
